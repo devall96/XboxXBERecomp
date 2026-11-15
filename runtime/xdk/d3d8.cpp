@@ -1224,14 +1224,16 @@ HLE_STDCALL(D3DDevice_DrawIndexedVertices, 3) {
 
 // DrawVerticesUP(prim, count, vertices, stride): the vertices are copied to a ring the render thread reads, stream 0
 // points there through a vertex buffer header for the draw. A half of the ring is written again once the draws
-// that read it are done.
+// that read it are done. The ring lives in system memory, not the title's 64 MB: a title that sizes its heap to the
+// memory it finds free (Whiplash) leaves no 4 MB contiguous block by its first UP draw. Physical and virtual addresses
+// outside the 64 MB pass through PhysicalFromVirtual and VirtualFromPhysical unchanged.
 namespace {
 constexpr uint32_t kUpRing = 4u << 20, kUpHalf = kUpRing / 2;
 uint32_t g_up_ring = 0, g_up_pos = 0, g_up_header = 0, g_up_fence[2] = {};
 
 uint32_t UpVertices(const void* src, uint32_t bytes) {
     if (!g_up_ring) {
-        g_up_ring = mem::AllocContiguous(kUpRing, 0, 0xFFFFFFFF, 0x1000);
+        g_up_ring = mem::AllocSystem(kUpRing, 0x1000);
         g_up_header = mem::AllocSystem(20);
         std::memset(HostPtr(g_up_header), 0, 20);
         W32(g_up_header, 1);  // a vertex buffer, one reference
