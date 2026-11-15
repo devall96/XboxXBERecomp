@@ -1302,7 +1302,30 @@ void EndPrimitive() {
     uint32_t prim = g_im_prim, count = uint32_t(g_im_vertices.size() / 64), handle = g_state.vs_handle;
     g_im_prim = 0;
     if (!prim || !count) return;
-    if (!(handle & 1) && (handle & 0xE) == 4) LOG_FIRST(1, "d3d: pretransformed immediate mode vertices are not supported");
+    if (!(handle & 1) && (handle & 0xE) == 4) {
+        // pretransformed FVF (XYZRHW): the slots are packed in the FVF's own layout and drawn as DrawVerticesUP draws,
+        // so the fixed pipeline's screen space path applies (Whiplash draws its fades and screens this way). A
+        // D3DCOLOR gets the 4 byte method's bytes back; a colour set with 4 floats keeps that component order.
+        gpu::VertexShader fvf;
+        gpu::FvfInputs(handle, fvf);
+        uint32_t stride = fvf.stream_stride[0];
+        static std::vector<uint8_t> bytes;
+        bytes.assign(size_t(count) * stride, 0);
+        for (uint32_t v = 0; v < count; v++)
+            for (uint32_t s = 0; s < 16; s++) {
+                const auto& in = fvf.inputs[s];
+                if (in.stream < 0) continue;
+                const float* src = &g_im_vertices[v * 64 + s * 4];
+                uint8_t* dst = bytes.data() + size_t(v) * stride + in.offset;
+                if (in.type == 0x40) {
+                    for (int c = 0; c < 4; c++) dst[c] = uint8_t(std::clamp(src[c], 0.0f, 1.0f) * 255.0f + 0.5f);
+                } else {
+                    std::memcpy(dst, src, (in.type >> 4) * 4u);  // 1 to 4 floats
+                }
+            }
+        DrawUp(prim, count, bytes.data(), stride);
+        return;
+    }
     auto bound = g_state.vs, from = handle & 1 ? bound : nullptr;
     Made& m = made[{from.get(), g_im_mask}];
     if (!m.vs) {
