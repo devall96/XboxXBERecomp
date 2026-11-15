@@ -635,6 +635,15 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
         app::FinishHandover();
     }
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+    // D3DSWAP_FINISH alone (4) finishes the frame without a flip: the library flips on D3DSWAP_COPY or BYPASSCOPY
+    // (flags & 3, 0 meaning COPY | FINISH). A title that swaps with BYPASSCOPY and then FINISH each frame (Whiplash)
+    // would otherwise present twice a frame, every other picture a buffer nothing was drawn into: a strobe.
+    constexpr uint32_t kSwapCopy = 1, kSwapBypassCopy = 2;
+    uint32_t flags = a[0] ? a[0] : 5;
+    if (!(flags & (kSwapCopy | kSwapBypassCopy))) {
+        if (g_backend) g_backend->Flush();
+        return Dev(kDevSwapCount);
+    }
     g_presents++;
     // the kept display is shown until the title presents its own
     kernel::SetSavedDataAddress(0);
