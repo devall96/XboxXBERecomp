@@ -1490,11 +1490,31 @@ static void RunCommands(uint32_t begin, uint32_t end) {
     constexpr uint32_t kArrayOffsets = 0x1720, kArrayFormatsEnd = 0x17A0, kArrayDraws = 0x1800;
     static std::vector<uint32_t> vertices;
     uint32_t prim = 0;
-    for (uint32_t p = begin; begin && p + 4 <= end;) {
+    // jumps and calls are followed (Whiplash's per frame buffer jumps into a 4 MB scene buffer, which jumps back): the
+    // walk ends where the buffer ends, a return with nothing to return to, or after a budget that stops a jump loop
+    constexpr uint32_t kReturn = 0x00020000;
+    uint32_t returns[4], depth = 0, budget = 1u << 22;
+    auto in_buffer = [&](uint32_t q) { return q >= begin && q < end; };
+    for (uint32_t p = begin; begin && p != end && budget; budget--) {
+        if (in_buffer(p) && p + 4 > end) break;
         // count in bits 18 to 28, bit 30 keeps the method for every value
         uint32_t head = R32(p), method = head & 0x1FFC, n = (head >> 18) & 0x7FF;
         p += 4;
-        if ((head & 0xA0030003) || n * 4 > end - p) {  // anything but a method header
+        if ((head & 3) == 1 || (head & 0xE0000003) == 0x20000000) {  // jump: old style (bit 0), new style (bit 29)
+            p = mem::VirtualFromPhysical((head & 3) == 1 ? head & ~3u : head & 0x1FFFFFFC);
+            continue;
+        }
+        if ((head & 3) == 2) {  // call
+            if (depth < 4) returns[depth++] = p;
+            p = mem::VirtualFromPhysical(head & ~3u);
+            continue;
+        }
+        if (head == kReturn) {
+            if (!depth) break;
+            p = returns[--depth];
+            continue;
+        }
+        if ((head & 0xA0030003) || (in_buffer(p) && n * 4 > end - p)) {  // anything but a method header
             LOG_FIRST(8, "d3d: pushed commands stop at %08X, %u bytes before the end", head, end - p);
             break;
         }
