@@ -60,6 +60,7 @@ void Load() {
     s.vsync = s.vsync_mode != VSync::Off;
     s.aniso = t["anisotropic_filtering"].value_or(s.aniso);
     s.custom_textures = t["custom_textures"].value_or(s.custom_textures);
+    s.ui_upscale = t["ui_upscale"].value_or(s.ui_upscale);
     s.dump_textures = t["dump_textures"].value_or(s.dump_textures);
     s.texture_dump_format = std::min(t["texture_dump_format"].value_or(s.texture_dump_format), 1u);
     s.join_ip = t["join_ip"].value_or(s.join_ip);
@@ -108,6 +109,7 @@ toml::table Table() {
                   {"vsync_mode", kVSync[uint32_t(s.vsync_mode)]},
                   {"anisotropic_filtering", int64_t(s.aniso)},
                   {"custom_textures", s.custom_textures},
+                  {"ui_upscale", s.ui_upscale},
                   {"dump_textures", s.dump_textures},
                   {"texture_dump_format", int64_t(s.texture_dump_format)},
                   {"join_ip", s.join_ip},

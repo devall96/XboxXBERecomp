@@ -438,6 +438,7 @@ struct Tex {
     uint64_t palette = 0;  // hash of the colours a P8 texture was decoded with
     uint8_t flags = 0;  // Extension::Decoded's
     const Tex* swap = nullptr;  // the texture pack's image drawn in its place
+    bool ui = false;            // drawn by a 2D draw (ui_upscale)
     uint64_t pack_key = 0;      // its pack image is still loading
     uint32_t pack_gen = 0;      // texturedumper::Generation the key was taken at, 0 after new bytes
 };
@@ -672,6 +673,7 @@ private:
     float draw_dx_ = 0, draw_dy_ = 0;  // console pixels the piece moves toward its edges
     bool HudPlacing() const;
     bool draw_sided_ = false;
+    bool draw_ui_ = false;  // this draw tests no depth and draws into the frame: its textures are 2D art
     struct SidedPiece {
         float lo, hi, top, bottom, side, vside, dx, dy;
     };
@@ -2319,6 +2321,10 @@ ID3D12Resource* D3D12Backend::BindGuestTexture(const State& s, int stage, const 
             tx.pack_gen = 0;
         }
     }
+    if (draw_ui_ && !tx.ui) {
+        tx.ui = true;
+        tx.pack_gen = 0;  // keyed again, as 2D art
+    }
     if (tx.pack_gen != texturedumper::Generation()) LatchPackKey(tx, d, fi, colours);
     if (tx.pack_key) LatchPackImage(tx);
     const Tex& drawn = tx.swap ? *tx.swap : tx;
@@ -2336,7 +2342,7 @@ void D3D12Backend::LatchPackKey(Tex& tx, const TextureDesc& d, const FormatInfo&
     uint64_t key = texturedumper::Key(d, fi, p, colours);
     texturedumper::Dump(key, d, p, colours);
     // dumping alone keys the bytes too: the pack image is not drawn then
-    bool edited = texturedumper::Edit(key, d, p, colours);
+    bool edited = texturedumper::Edit(key, d, p, colours, tx.ui);
     tx.pack_key = edited || texturedumper::Replacing() ? key : 0;
 }
 
@@ -3305,6 +3311,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
 
     // stage textures, then the pixel shader made for them
     DrawTextures stages;
+    draw_ui_ = s.rs[kRsZEnable] == 0 && bound_rt_ && bound_rt_->gw == guest_w_ && bound_rt_->gh == guest_h_;
     if (!BindStageTexturesAndTargets(s, stages)) return;
     PixelKey pk = MakePixelKey(s, stages.info);
     pk.quad = sh.quad;

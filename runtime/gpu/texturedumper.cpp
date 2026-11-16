@@ -57,6 +57,7 @@ struct Latched {
     bool replacing = false;
     bool dumping = false;
     uint32_t format = 0;
+    bool ui_upscale = false;
     bool operator==(const Latched&) const = default;
 };
 
@@ -77,7 +78,7 @@ struct Pack {
     std::unordered_set<uint64_t> asked;
     std::unordered_map<uint64_t, std::optional<Image>> loaded;  // empty: the file did not load
     std::unordered_set<uint64_t> dumped;
-    std::unordered_set<uint64_t> edited;  // keys GameInfo::texture_image makes, the render thread's
+    std::unordered_map<uint64_t, bool> edited;  // keys Edit makes, and whether as 2D, the render thread's
 };
 std::atomic<bool> g_refresh{false};
 
@@ -507,7 +508,7 @@ Image Decode(const TextureDesc& d, const uint8_t* guest, const uint32_t* palette
 // the settings into g.set; false when none changed
 bool LatchSettings() {
     const app::Settings& s = app::Get();
-    Latched now{s.custom_textures, s.dump_textures, s.texture_dump_format};
+    Latched now{s.custom_textures, s.dump_textures, s.texture_dump_format, s.ui_upscale};
     if (now == g.set) return false;
     g.set = now;
     fs::path root = app::DataDir() / "textures";
@@ -539,6 +540,116 @@ void NoteFolderChange(Clock::time_point now) {
     if (FindNextChangeNotification(g.watch)) return;
     FindCloseChangeNotification(g.watch);  // the folder went away
     g.watch = INVALID_HANDLE_VALUE;
+}
+
+// UI upscaling
+
+constexpr uint8_t kSpreadAlpha = 128;  // a texel of the shapes, whose colour spreads
+
+// flat shapes: mostly clear and solid texels, few partly clear ones but at the shapes' edges (fonts, frames, hard
+// edged icons); glows, shadows and gradients (mostly partly clear) and opaque pictures are left as they are
+bool FlatShapes(const std::vector<uint8_t>& bgra) {
+    size_t n = bgra.size() / 4, clear = 0, solid = 0;
+    constexpr uint8_t kClear = 16, kSolid = 240;
+    for (size_t i = 0; i < n; i++) {
+        uint8_t a = bgra[i * 4 + 3];
+        clear += a < kClear;
+        solid += a >= kSolid;
+    }
+    size_t shape = n - clear, mid = shape - solid;
+    constexpr double kMinClear = 0.1, kMinSolid = 0.02, kMaxMid = 0.4;
+    return n && clear >= n * kMinClear && solid >= n * kMinSolid && mid <= shape * kMaxMid;
+}
+
+// Scale2x (EPX) on a mask: corners stay square, diagonal steps halve
+std::vector<uint8_t> Scale2x(const std::vector<uint8_t>& m, uint32_t w, uint32_t h) {
+    std::vector<uint8_t> out(size_t(w) * h * 4);
+    auto at = [&](int x, int y) {
+        return m[size_t(std::clamp(y, 0, int(h) - 1)) * w + size_t(std::clamp(x, 0, int(w) - 1))];
+    };
+    uint32_t W = w * 2;
+    for (int y = 0; y < int(h); y++)
+        for (int x = 0; x < int(w); x++) {
+            uint8_t p = at(x, y), a = at(x, y - 1), b = at(x + 1, y), c = at(x - 1, y), d = at(x, y + 1);
+            uint8_t* o = &out[size_t(y) * 2 * W + size_t(x) * 2];
+            o[0] = c == a && c != d && a != b ? a : p;
+            o[1] = a == b && a != c && b != d ? b : p;
+            o[W] = d == c && d != b && c != a ? c : p;
+            o[W + 1] = b == d && b != a && d != c ? d : p;
+        }
+    return out;
+}
+
+// kUiScale x the texels: the shapes' outline from Scale2x three times (8x) averaged 2x2, the colour bilinear from
+// the shapes' own texels (spread past their edges first, so no dark fringe comes in from clear texels)
+constexpr uint32_t kUiScale = 4;
+bool UpscaleFlat(std::vector<uint8_t>& bgra, uint32_t& w, uint32_t& h) {
+    size_t n = size_t(w) * h;
+    std::vector<uint8_t> mask(n);
+    for (size_t i = 0; i < n; i++) mask[i] = bgra[i * 4 + 3] >= 128;
+    uint32_t mw = w, mh = h;
+    for (int pass = 0; pass < 3; pass++) {
+        mask = Scale2x(mask, mw, mh);
+        mw *= 2;
+        mh *= 2;
+    }
+    // colour spread out of the shapes: each clear texel takes its shaped neighbours' average, twice
+    std::vector<float> col(n * 3);
+    std::vector<uint8_t> has(n);
+    for (size_t i = 0; i < n; i++) {
+        has[i] = bgra[i * 4 + 3] >= kSpreadAlpha;
+        for (int c = 0; c < 3; c++) col[i * 3 + c] = bgra[i * 4 + c];
+    }
+    for (int pass = 0; pass < 2; pass++) {
+        std::vector<uint8_t> next = has;
+        std::vector<float> ncol = col;
+        for (int y = 0; y < int(h); y++)
+            for (int x = 0; x < int(w); x++) {
+                size_t i = size_t(y) * w + x;
+                if (has[i]) continue;
+                float sum[3] = {};
+                int k = 0;
+                for (int dy = -1; dy <= 1; dy++)
+                    for (int dx = -1; dx <= 1; dx++) {
+                        int nx = x + dx, ny = y + dy;
+                        if (nx < 0 || ny < 0 || nx >= int(w) || ny >= int(h)) continue;
+                        size_t j = size_t(ny) * w + nx;
+                        if (!has[j]) continue;
+                        for (int c = 0; c < 3; c++) sum[c] += col[j * 3 + c];
+                        k++;
+                    }
+                if (!k) continue;
+                for (int c = 0; c < 3; c++) ncol[i * 3 + c] = sum[c] / k;
+                next[i] = 1;
+            }
+        has.swap(next);
+        col.swap(ncol);
+    }
+    uint32_t W = w * kUiScale, H = h * kUiScale;
+    std::vector<uint8_t> out(size_t(W) * H * 4);
+    auto c_at = [&](int x, int y, int c) {
+        return col[(size_t(std::clamp(y, 0, int(h) - 1)) * w + size_t(std::clamp(x, 0, int(w) - 1))) * 3 + c];
+    };
+    for (uint32_t y = 0; y < H; y++)
+        for (uint32_t x = 0; x < W; x++) {
+            float fx = (x + 0.5f) / kUiScale - 0.5f, fy = (y + 0.5f) / kUiScale - 0.5f;
+            int x0 = int(std::floor(fx)), y0 = int(std::floor(fy));
+            float tx = fx - x0, ty = fy - y0;
+            uint8_t* o = &out[(size_t(y) * W + x) * 4];
+            for (int c = 0; c < 3; c++) {
+                float v = (c_at(x0, y0, c) * (1 - tx) + c_at(x0 + 1, y0, c) * tx) * (1 - ty) +
+                          (c_at(x0, y0 + 1, c) * (1 - tx) + c_at(x0 + 1, y0 + 1, c) * tx) * ty;
+                o[c] = uint8_t(std::clamp(v + 0.5f, 0.0f, 255.0f));
+            }
+            // the 8x mask's 2x2 under this texel
+            size_t m = size_t(y) * 2 * mw + size_t(x) * 2;
+            int cover = mask[m] + mask[m + 1] + mask[m + mw] + mask[m + mw + 1];
+            o[3] = uint8_t(cover * 255 / 4);
+        }
+    bgra.swap(out);
+    w = W;
+    h = H;
+    return true;
 }
 
 // lists the pack once its folder is watched, then again once its files changed and settled; true when listed
@@ -573,10 +684,20 @@ bool Update() {
     return reloaded || refresh;
 }
 
-bool Edit(uint64_t key, const TextureDesc& d, const uint8_t* guest, const uint32_t* palette) {
+bool Edit(uint64_t key, const TextureDesc& d, const uint8_t* guest, const uint32_t* palette, bool ui) {
     const app::GameInfo& gi = app::kGame;
-    if (!key || !gi.texture_edits || !gi.texture_image || !gi.texture_edits(key)) return false;
-    if (!g.edited.insert(key).second) return true;
+    bool game = key && gi.texture_edits && gi.texture_image && gi.texture_edits(key);
+    constexpr uint32_t kMaxUiSide = 512;  // 2D art past this is a picture, not a font or a frame
+    ui = ui && key && g.set.ui_upscale && d.width <= kMaxUiSide && d.height <= kMaxUiSide;
+    if (!game && !ui) return false;
+    auto [at, fresh] = g.edited.try_emplace(key, ui);
+    if (!fresh) {
+        if (!ui || at->second) return true;
+        // seen in 3D before, now in 2D: made again
+        at->second = true;
+        std::lock_guard l(g.lock);
+        g.loaded.erase(key);
+    }
     uint32_t revision;
     {
         std::lock_guard l(g.lock);
@@ -584,7 +705,7 @@ bool Edit(uint64_t key, const TextureDesc& d, const uint8_t* guest, const uint32
     }
     TextureDesc top = d;
     top.levels = 1;
-    Post([key, revision, img = Decode(top, guest, palette)] {
+    Post([key, revision, ui, game, img = Decode(top, guest, palette)] {
         IWICImagingFactory* wic = Wic();
         std::vector<uint8_t> dds;
         ComPtr<IWICBitmapSource> src;
@@ -592,7 +713,9 @@ bool Edit(uint64_t key, const TextureDesc& d, const uint8_t* guest, const uint32
         bool ok = wic && SUCCEEDED(LevelZeroBitmap(wic, img, dds, src)) &&
                   SUCCEEDED(src->CopyPixels(nullptr, img.width * 4, UINT(px.size()), px.data()));
         uint32_t w = img.width, h = img.height;
-        ok = ok && app::kGame.texture_image(key, w, h, px) && w && h && px.size() == size_t(w) * h * 4;
+        bool upscaled = ok && ui && FlatShapes(px) && UpscaleFlat(px, w, h);
+        bool edited = ok && game && app::kGame.texture_image(key, w, h, px);
+        ok = (upscaled || edited) && w && h && px.size() == size_t(w) * h * 4;
         std::optional<Image> made;
         if (ok) {
             made.emplace();
@@ -613,7 +736,7 @@ uint32_t Generation() { return g.generation; }
 bool Replacing() { return g.set.replacing && !g.files.empty(); }
 
 uint64_t Key(const TextureDesc& d, const FormatInfo& fi, const uint8_t* guest, const uint32_t* palette) {
-    if (!Replacing() && !g.set.dumping && !app::kGame.texture_edits) return 0;
+    if (!Replacing() && !g.set.dumping && !g.set.ui_upscale && !app::kGame.texture_edits) return 0;
     // cube maps, volumes and depth stay the console's; linear ones are movie frames and the game's own copies
     if (d.cube || d.depth > 1 || d.linear || UploadFormat(fi.host) == DXGI_FORMAT_UNKNOWN) return 0;
     uint32_t shape[] = {d.format, d.width, d.height};
