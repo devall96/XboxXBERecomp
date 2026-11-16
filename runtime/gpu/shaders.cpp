@@ -55,6 +55,7 @@ const char* kCommonTail = R"(    float4 spread[4];
     float4 lt[56];
     float4 rtshift;
     float4 zparams;
+    float4 wide;
 };
 )";
 
@@ -230,6 +231,9 @@ const char* kVsEpilogue = R"(
     if (surf.w == 0 && abs(p.y - (surf.y - 0.5)) < 1e-3) p.y = surf.y;
     q.x = p.x * 2 / surf.x - 1;
     q.y = 1 - p.y * 2 / surf.y;
+    // a widened frame: 2D (w 1, as screen space and the console's sprites have it) keeps its 4:3 in the middle,
+    // except at the frame's left and right edges, where full screen passes and bars stay full width
+    if (wide.y != 0 && p.w == 1 && p.x > 1 && p.x < surf.x - 1) q.x *= wide.x;
     q.z = p.z * surf.z;
     q.xyz *= p.w;
     q.w = p.w;

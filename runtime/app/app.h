@@ -15,6 +15,12 @@ namespace app {
 
 enum class DisplayMode : uint32_t { Fullscreen, Borderless, Windowed };
 inline constexpr uint32_t kFpsCapRefresh = 1;  // fps_cap: the monitor's refresh rate
+// widescreen: what a wide output gets
+enum class Wide : uint32_t {
+    Console,  // the console reports a widescreen TV at 3:2 and wider, and the frame is shown 16:9 (anamorphic)
+    Off,      // a 4:3 TV: the frame is shown 4:3 with bars at the sides
+    Expand,   // the game draws a wider view (GameInfo::expands): the frame fills the output, 2D stays 4:3 centred
+};
 
 struct Settings {
     DisplayMode display_mode = DisplayMode::Borderless;
@@ -27,6 +33,7 @@ struct Settings {
     bool dump_textures = false;      // each texture once into textures\dumps\ beside the exe
     uint32_t texture_dump_format = 0;  // 0 PNG, 1 DDS
     uint32_t audio_output = 0;         // audio::kOutputAuto, Stereo, Surround or Mono
+    Wide widescreen = Wide::Console;   // Expand where the game has it (Load picks it for a new settings file)
     std::string join_ip;                   // co-op: a host past the LAN the system link search also asks
 };
 
@@ -41,9 +48,19 @@ struct Mode {
 };
 Mode Desktop();
 Mode Output();
-float RenderScale(uint32_t guest_height);
-// the output is 3:2 or wider: the console reports a widescreen TV and the frame is shown 16:9, else 4:3 as on a 4:3 TV
+// host pixels per console pixel: the shown view (GameInfo::view_w/h, else the back buffer) fills its place in the
+// output at render_percent, the larger of the two axes' scales where the shown aspect differs from the console's
+float RenderScale(uint32_t guest_width, uint32_t guest_height);
+// the renderer's window picture size (its client area): the output the render scale and the shown aspect follow, so
+// a resized window, a borderless desktop or a windowed size all render at the pixels they show; 0 before the first
+void SetPresentSize(uint32_t width, uint32_t height);
+// Wide::Console and the output is 3:2 or wider: the console reports a widescreen TV and the frame is shown 16:9
 bool Widescreen();
+// the aspect the frame is shown at: the output's under Wide::Expand (4:3 up to 32:9), else 16:9 or 4:3
+float FrameAspect();
+// Wide::Expand: how much wider than 4:3 the view is (FrameAspect / (4/3)), which the game widens its projection by
+// and 2D draws are narrowed by; 1 otherwise
+float WideFactor();
 
 std::filesystem::path ExeDir();
 // the game in assets (game_files.cpp): its folder and this executable's xbe, from the extracted files or a disc
@@ -101,6 +118,11 @@ struct GameInfo {
     void (*rumble)(int port, uint16_t& left, uint16_t& right);
     // xbe file name, SHA-1: other releases the executable runs, each from its own [xbe] named config
     std::vector<std::pair<const char*, const char*>> releases;
+    // the part of the back buffer a TV shows (the top left view_w x view_h), 0 for all of it: a game that draws
+    // 640x448 of a 640x480 buffer leaves its last lines unused, and its 4:3 is the 448 lines' aspect
+    uint32_t view_w = 0, view_h = 0;
+    // the game widens its own 3D view by WideFactor() (a hook on its projection), which allows Wide::Expand
+    bool expands = false;
 };
 extern const GameInfo kGame;
 

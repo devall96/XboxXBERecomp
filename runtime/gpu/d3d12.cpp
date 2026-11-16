@@ -45,6 +45,7 @@ using Microsoft::WRL::ComPtr;
 namespace gpu {
 
 namespace {
+void WriteBmp(const std::filesystem::path& path, uint32_t w, uint32_t h, const std::vector<uint8_t>& px);
 
 constexpr int kFrames = 3;
 constexpr uint64_t kStaleFrames = 8;  // frames a target may go unused and still be read back
@@ -568,6 +569,8 @@ private:
     void FillPipelineDesc(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps, D3D12_GRAPHICS_PIPELINE_STATE_DESC& d) const;
     void ExpandPoints(D3D12_GRAPHICS_PIPELINE_STATE_DESC& d, bool sprite);
     float TargetScale() const;  // host pixels per console pixel of the bound target
+    void FillWideConstants(DrawConstants& c) const;
+    float wide_ = 1.0f;  // app::WideFactor, read once a frame
     float RenderTargetShift(const State& s, const DrawShaders& sh) const;
     void FillDepthConstants(const State& s, const DrawShaders& sh, const PsoKey& k, DrawConstants& c) const;
     uint8_t* UploadVertexConstants(const State& s);
@@ -638,6 +641,8 @@ private:
     };
     void CapSave(const CapImage& img, const char* name);
     void CapSave(Target& t, const char* name);
+    void CapShown(uint32_t bi);
+    std::filesystem::path shown_dir_;  // the last capture's folder, for CapShown after it closed
     // a surface's place in targets_: its key, console size and entry, end when it has none
     struct TargetSlot {
         uint32_t data;
@@ -865,6 +870,7 @@ bool D3D12Backend::CreateSwapChain(HWND hwnd) {
     GetClientRect(hwnd, &rc);
     bb_w_ = std::max<LONG>(rc.right - rc.left, 1);
     bb_h_ = std::max<LONG>(rc.bottom - rc.top, 1);
+    app::SetPresentSize(bb_w_, bb_h_);
     DXGI_SWAP_CHAIN_DESC1 sd{};
     sd.Width = bb_w_;
     sd.Height = bb_h_;
@@ -962,7 +968,8 @@ void D3D12Backend::CreateGammaLut() {
 }
 
 void D3D12Backend::LoadSettings() {
-    scale_ = app::RenderScale(guest_h_);
+    scale_ = app::RenderScale(guest_w_, guest_h_);
+    wide_ = app::WideFactor();
     texturedumper::Update();
     ext_ = g_extension.get();
     if (ext_) {
@@ -1654,6 +1661,14 @@ void D3D12Backend::ExpandPoints(D3D12_GRAPHICS_PIPELINE_STATE_DESC& d, bool spri
     d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     d.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     d.RasterizerState.FrontCounterClockwise = FALSE;
+}
+
+// app::Wide::Expand: draws into the frame (a target of the back buffer's size) narrow their 2D to 4:3
+void D3D12Backend::FillWideConstants(DrawConstants& c) const {
+    c.wide[0] = c.wide[1] = 0;
+    if (wide_ == 1.0f || !bound_rt_ || bound_rt_->gw != guest_w_ || bound_rt_->gh != guest_h_) return;
+    c.wide[0] = 1.0f / wide_;
+    c.wide[1] = 1;
 }
 
 float D3D12Backend::TargetScale() const {
@@ -2474,6 +2489,7 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const 
     if (k.topo == uint32_t(Topology::Points)) c.surf[3] = TargetScale();
     FillFogConstants(s, sh.prog, c);
     FillCombinerConstants(s, c);
+    FillWideConstants(c);
     if (ext_) ext_->Constants(reinterpret_cast<float(*)[4]>(vsc), c.ext, bound_rt_, k.blend ? k.src : 1);
     FillDepthConstants(s, sh, k, c);
     FillTextureConstants(s, sh, stages, c);
@@ -3190,6 +3206,7 @@ void D3D12Backend::ResizeSwap() {
     CreateBackBufferViews();
     bb_w_ = w;
     bb_h_ = h;
+    app::SetPresentSize(w, h);
 }
 
 void D3D12Backend::FinishCapture(const Surface& front) {
@@ -3203,6 +3220,7 @@ void D3D12Backend::FinishCapture(const Surface& front) {
     }
     fclose(cap_);
     cap_ = nullptr;
+    shown_dir_ = cap_dir_;
     cap_tex_.clear();
     LOGI("d3d12: frame captured to %s", cap_dir_.string().c_str());
 }
@@ -3249,14 +3267,15 @@ void D3D12Backend::UploadGammaRamp() {
 }
 
 void D3D12Backend::BlitFrame(Target& t) {
-    // 16:9 when the console reports a widescreen display, else 4:3
-    bool wide = app::Widescreen();
-    float aspect = wide ? 16.0f / 9.0f : 4.0f / 3.0f;
+    // the view a TV shows (the game's, else the whole buffer) at 4:3, 16:9 for a widescreen TV, or the output's
+    float aspect = app::FrameAspect();
     float w = float(bb_w_);
     float h = float(bb_h_);
     float vw = std::min(w, h * aspect);
     float vh = vw / aspect;
     float uv[4] = {0, 0, 1, 1};
+    if (app::kGame.view_w && t.gw) uv[2] = std::min(1.0f, float(app::kGame.view_w) / t.gw);
+    if (app::kGame.view_h && t.gh) uv[3] = std::min(1.0f, float(app::kGame.view_h) / t.gh);
     D3D12_VIEWPORT vp{(w - vw) / 2, (h - vh) / 2, vw, vh, 0, 1};
     D3D12_RECT scissor{0, 0, LONG(bb_w_), LONG(bb_h_)};
     cl_->RSSetViewports(1, &vp);
@@ -3371,8 +3390,10 @@ void LogPerf() {
 
 void D3D12Backend::Present(const Surface& front) {
     PerfScope perf_present{g_perf.present};
+    bool shown = false;  // F3: the window's picture too, as presented
     if (cap_) {
         FinishCapture(front);
+        shown = true;
     } else if (g_capture.exchange(false) && CaptureOn()) {
         StartCapture();
     }
@@ -3385,6 +3406,7 @@ void D3D12Backend::Present(const Surface& front) {
 
     uint32_t bi = swap_->GetCurrentBackBufferIndex();
     DrawFrame(t, bi);
+    if (shown) CapShown(bi);
     Submit(false);
     present_fence_[presents_ % (kFrames + 1)].store(fence_value_);
     DeliverReports();
@@ -3411,7 +3433,7 @@ void D3D12Backend::WaitGpuFrame(uint64_t n) {
 
 void D3D12Backend::ApplySettings() {
     if (texturedumper::Update()) ReleasePackTextures();
-    float want = app::RenderScale(guest_h_);
+    float want = app::RenderScale(guest_w_, guest_h_);
     bool remake = ext_ && ext_->Settings();
     if (std::fabs(want - scale_) > 1e-4f || remake) {
         Flush();
@@ -3421,6 +3443,7 @@ void D3D12Backend::ApplySettings() {
         if (ext_) ext_->Reset(*this);
         bound_rt_ = bound_ds_ = nullptr;
     }
+    wide_ = app::WideFactor();
 }
 
 // the target resolved, then shrunk with o when it is not guest sized BGRA; res null on failure
@@ -3658,15 +3681,31 @@ void D3D12Backend::CapSave(const CapImage& img, const char* name) {
     ComPtr<ID3D12Resource> down = Shrink(img.res, *img.state, img.fmt, img.w, img.h, {.mul = img.mul});
     std::vector<uint8_t> px;
     if (!down || !ReadBack(down.Get(), img.w, img.h, px)) return;
-    FILE* f = _wfopen((cap_dir_ / (std::string(name) + ".bmp")).c_str(), L"wb");
+    WriteBmp(cap_dir_ / (std::string(name) + ".bmp"), img.w, img.h, px);
+}
+
+// the swap chain's buffer as the window shows it, after the frame and the UI: shown.bmp beside final.bmp
+void D3D12Backend::CapShown(uint32_t bi) {
+    D3D12_RESOURCE_STATES st = D3D12_RESOURCE_STATE_PRESENT;
+    Transition(bb_[bi].Get(), st, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    std::vector<uint8_t> px;
+    bool ok = ReadBack(bb_[bi].Get(), bb_w_, bb_h_, px);
+    Transition(bb_[bi].Get(), st, D3D12_RESOURCE_STATE_PRESENT);
+    if (!ok) return;
+    for (size_t i = 3; i < px.size(); i += 4) px[i] = 0xFF;
+    WriteBmp(shown_dir_ / "shown.bmp", bb_w_, bb_h_, px);
+}
+
+void WriteBmp(const std::filesystem::path& path, uint32_t w, uint32_t h, const std::vector<uint8_t>& px) {
+    FILE* f = _wfopen(path.c_str(), L"wb");
     if (!f) return;
     uint8_t hd[kBmpHeaderBytes] = {'B', 'M'};  // BITMAPFILEHEADER and BITMAPINFOHEADER, top down 32 bit
     auto put = [&](int o, uint32_t v) { std::memcpy(hd + o, &v, 4); };
     put(kBmpFileSize, kBmpHeaderBytes + uint32_t(px.size()));
     put(kBmpPixelOffset, kBmpHeaderBytes);
     put(kBmpInfoSize, kBmpInfoBytes);
-    put(kBmpWidth, img.w);
-    put(kBmpHeight, uint32_t(-int32_t(img.h)));
+    put(kBmpWidth, w);
+    put(kBmpHeight, uint32_t(-int32_t(h)));
     hd[kBmpPlanes] = 1;
     hd[kBmpBitCount] = 32;
     put(kBmpImageSize, uint32_t(px.size()));

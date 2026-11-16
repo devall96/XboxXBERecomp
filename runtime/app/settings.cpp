@@ -8,6 +8,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <fstream>
 #include <mutex>
 #include <sstream>
@@ -23,6 +24,7 @@ namespace app {
 namespace {
 
 const char* kModes[] = {"fullscreen", "borderless", "windowed"};
+const char* kWide[] = {"console", "off", "expand"};
 
 std::filesystem::path File() { return ExeDir() / kGame.settings; }
 
@@ -35,6 +37,7 @@ Settings& Get() {
 
 void Load() {
     Settings& s = Get();
+    if (kGame.expands) s.widescreen = Wide::Expand;
     toml::table t;
     try {
         t = toml::parse_file(File().string());
@@ -55,6 +58,10 @@ void Load() {
     s.texture_dump_format = std::min(t["texture_dump_format"].value_or(s.texture_dump_format), 1u);
     s.join_ip = t["join_ip"].value_or(s.join_ip);
     s.audio_output = std::min(t["audio_output"].value_or(s.audio_output), audio::kOutputMono);
+    std::string wide = t["widescreen"].value_or(std::string(kWide[uint32_t(s.widescreen)]));
+    for (uint32_t i = 0; i < 3; i++)
+        if (wide == kWide[i]) s.widescreen = Wide(i);
+    if (s.widescreen == Wide::Expand && !kGame.expands) s.widescreen = Wide::Console;
     for (const Option& o : kGame.options) {
         if (o.flag) *o.flag = t[o.key].value_or(*o.flag);
         else *o.value = t[o.key].value_or(*o.value);
@@ -78,7 +85,8 @@ toml::table Table() {
                   {"dump_textures", s.dump_textures},
                   {"texture_dump_format", int64_t(s.texture_dump_format)},
                   {"join_ip", s.join_ip},
-                  {"audio_output", int64_t(s.audio_output)}};
+                  {"audio_output", int64_t(s.audio_output)},
+                  {"widescreen", kWide[uint32_t(s.widescreen)]}};
     for (const Option& o : kGame.options) {
         if (o.flag) t.insert(o.key, *o.flag);
         else t.insert(o.key, int64_t(*o.value));
@@ -147,15 +155,60 @@ Mode CachedOutput() {
     return mode;
 }
 
+namespace {
+std::atomic<uint64_t> g_present{0};  // width << 32 | height
+}
+
+void SetPresentSize(uint32_t width, uint32_t height) {
+    constexpr uint32_t kMinimized = 16;  // a minimised window's client area: keep the last real size
+    if (width < kMinimized || height < kMinimized) return;
+    g_present.store(uint64_t(width) << 32 | height);
+}
+
+// what the frame is shown on: the window's picture once the renderer has one, else the resolution setting
+Mode Shown() {
+    uint64_t p = g_present.load();
+    if (p) return {uint32_t(p >> 32), uint32_t(p)};
+    return CachedOutput();
+}
+
 // asked per frame and per HUD quad: CachedOutput costs a monitor lookup, the registry only on a change
 bool Widescreen() {
-    Mode m = CachedOutput();
+    if (Get().widescreen != Wide::Console) return false;
+    Mode m = Shown();
     return m.width * 2 >= m.height * 3;  // 3:2 or wider
 }
 
-float RenderScale(uint32_t guest_height) {
-    float h = CachedOutput().height * (Get().render_percent / 100.0f);
-    return guest_height ? std::max(h / guest_height, 0.1f) : 1.0f;
+float FrameAspect() {
+    constexpr float k43 = 4.0f / 3.0f;
+    constexpr float kWidest = 32.0f / 9.0f;
+    if (Get().widescreen == Wide::Expand) {
+        Mode m = Shown();
+        if (!m.height) return k43;
+        return std::clamp(float(m.width) / float(m.height), k43, kWidest);
+    }
+    return Widescreen() ? 16.0f / 9.0f : k43;
+}
+
+float WideFactor() {
+    constexpr float kMin = 1.01f;  // below this the view stays the console's
+    if (Get().widescreen != Wide::Expand) return 1.0f;
+    float k = FrameAspect() * 3.0f / 4.0f;
+    return k < kMin ? 1.0f : k;
+}
+
+float RenderScale(uint32_t guest_width, uint32_t guest_height) {
+    if (!guest_width || !guest_height) return 1.0f;
+    Mode m = Shown();
+    float vw = float(kGame.view_w ? kGame.view_w : guest_width);
+    float vh = float(kGame.view_h ? kGame.view_h : guest_height);
+    // the view's place in the output: as tall as fits at the shown aspect
+    float aspect = FrameAspect();
+    float h = std::min(float(m.height), float(m.width) / aspect);
+    float w = h * aspect;
+    float pct = std::max(Get().render_percent, 10u) / 100.0f;  // 200 and up supersample
+    // never under the console's own resolution unless render_percent asks for less
+    return std::max(std::max(h / vh, w / vw) * pct, std::min(pct, 1.0f));
 }
 
 }  // namespace app
