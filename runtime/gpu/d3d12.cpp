@@ -657,10 +657,11 @@ private:
     float draw_x_[2] = {1, 0};  // MeasureDrawX: this draw's v0.x range
     void ChooseDrawSide(bool writes_depth);
     float draw_side_ = 0, draw_vside_ = 0;
+    float draw_dx_ = 0, draw_dy_ = 0;  // console pixels the piece moves toward its edges
     bool HudPlacing() const;
     bool draw_sided_ = false;
     struct SidedPiece {
-        float lo, hi, top, bottom, side, vside;
+        float lo, hi, top, bottom, side, vside, dx, dy;
     };
     std::vector<SidedPiece> sided_;       // this frame's pieces placed against an edge
     std::vector<SidedPiece> prev_sided_;  // last frame's
@@ -1801,13 +1802,10 @@ void D3D12Backend::FillWideConstants(DrawConstants& c) const {
     c.wide[1] = 1;
     c.wide[2] = draw_side_;
     c.wide[3] = draw_sided_ ? 1.0f : 0.0f;
-    // the console's TV safe margin as Whiplash's HUD keeps it, in console pixels: the share hud_edge takes away
-    constexpr float kMarginX = 32, kMarginY = 18;
-    float edge = app::Get().hud_edge / 100.0f;
-    if (edge > 0 && draw_sided_) {
+    if (draw_sided_ && (draw_dx_ > 0 || draw_dy_ > 0)) {
         c.hud[0] = draw_vside_;
-        c.hud[1] = 2 * kMarginX * edge / guest_w_ / wide_;  // console pixels stay square in a widened frame
-        c.hud[2] = 2 * kMarginY * edge / guest_h_;
+        c.hud[1] = 2 * draw_dx_ / guest_w_ / wide_;  // console pixels stay square in a widened frame
+        c.hud[2] = 2 * draw_dy_ / guest_h_;
         c.hud[3] = 1;
     }
 }
@@ -1823,6 +1821,7 @@ void D3D12Backend::ChooseDrawSide(bool writes_depth) {
     draw_sided_ = false;
     draw_side_ = 0;
     draw_vside_ = 0;
+    draw_dx_ = draw_dy_ = 0;
     float lo = draw_x_[0], hi = draw_x_[1], top = draw_y_[0], bottom = draw_y_[1];
     if (lo > hi) return;
     // the console's screen: its width, and the height its picture uses (the game's view, else the buffer)
@@ -1849,6 +1848,15 @@ void D3D12Backend::ChooseDrawSide(bool writes_depth) {
     else if (hi > w * (1 - kNearEdge) && lo > w * (1 - kHalfPlus)) draw_side_ = 1;
     if (top < h * kNearEdge && bottom < h * kHalfPlus) draw_vside_ = -1;
     else if (bottom > h * (1 - kNearEdge) && top > h * (1 - kHalfPlus)) draw_vside_ = 1;
+    // the move past the console's TV safe margin (its share hud_edge takes away, in console pixels), never closer to
+    // the edge than kGap: a piece already near it (the title's frame and its label) stays on the screen
+    constexpr float kMarginX = 32, kMarginY = 18, kGap = 6;
+    float edge = app::Get().hud_edge / 100.0f;
+    auto move = [&](float margin, float distance) { return std::max(0.0f, std::min(margin * edge, distance - kGap)); };
+    if (draw_side_ == -1) draw_dx_ = move(kMarginX, lo);
+    if (draw_side_ == 1) draw_dx_ = move(kMarginX, w - hi);
+    if (draw_vside_ == -1) draw_dy_ = move(kMarginY, top);
+    if (draw_vside_ == 1) draw_dy_ = move(kMarginY, h - bottom);
     // inside a box placed earlier this frame: its text and bars go where the box went
     // this frame's boxes, then last frame's: text drawn before its box finds the box where it was a frame ago
     bool inside = false;
@@ -1857,6 +1865,8 @@ void D3D12Backend::ChooseDrawSide(bool writes_depth) {
             if (lo >= p.lo - kSlack && hi <= p.hi + kSlack && top >= p.top - kSlack && bottom <= p.bottom + kSlack) {
                 draw_side_ = p.side;
                 draw_vside_ = p.vside;
+                draw_dx_ = p.dx;
+                draw_dy_ = p.dy;
                 inside = true;
                 break;
             }
@@ -1871,7 +1881,7 @@ void D3D12Backend::ChooseDrawSide(bool writes_depth) {
         return;
     // a box drawn as border pieces: touching pieces on one side grow into the box they outline
     constexpr float kTouch = 4.0f;
-    SidedPiece piece{lo, hi, top, bottom, draw_side_, draw_vside_};
+    SidedPiece piece{lo, hi, top, bottom, draw_side_, draw_vside_, draw_dx_, draw_dy_};
     for (auto it = sided_.begin(); it != sided_.end();) {
         bool touches = it->side == piece.side && it->vside == piece.vside && it->lo <= piece.hi + kTouch && piece.lo <= it->hi + kTouch &&
                        it->top <= piece.bottom + kTouch && piece.top <= it->bottom + kTouch;
@@ -1879,7 +1889,8 @@ void D3D12Backend::ChooseDrawSide(bool writes_depth) {
         float merged_h = std::max(it->bottom, piece.bottom) - std::min(it->top, piece.top);
         if (touches && merged <= w * kMaxCarrier && merged_h <= h * kMaxCarrierH) {
             piece = {std::min(it->lo, piece.lo), std::max(it->hi, piece.hi), std::min(it->top, piece.top),
-                     std::max(it->bottom, piece.bottom), piece.side, piece.vside};
+                     std::max(it->bottom, piece.bottom), piece.side, piece.vside, std::min(it->dx, piece.dx),
+                     std::min(it->dy, piece.dy)};
             it = sided_.erase(it);
         } else {
             ++it;
