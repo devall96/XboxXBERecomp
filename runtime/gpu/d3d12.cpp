@@ -583,6 +583,8 @@ private:
     bool EnsureMid(uint32_t w, uint32_t h);
     uint32_t PresentViews(ID3D12Resource* res, DXGI_FORMAT fmt);
     bool CaptureDue();
+    void PresentSwap();
+    PerfClock::time_point last_swap_{};
     bool SkippedByTexture(const State& s);
     void WriteFrameTime();
     size_t capture_at_next_ = 0;
@@ -3333,6 +3335,24 @@ void D3D12Backend::BlitFrame(Target& t) {
     Blit(t.res.Get(), t.fmt, uv, {.gamma = gamma_});
 }
 
+// app::VSync: the sync interval and tearing for this present
+void D3D12Backend::PresentSwap() {
+    using app::VSync;
+    VSync mode = app::Get().vsync_mode;
+    auto now = PerfClock::now();
+    double interval = std::chrono::duration<double, std::milli>(now - last_swap_).count();
+    last_swap_ = now;
+    bool wait = mode == VSync::On;
+    if (mode == VSync::Adaptive) {
+        // late against the refresh: shown at once (a tear) rather than held for the next refresh
+        constexpr double kLate = 1.05;
+        uint32_t hz = app::RefreshRate();
+        wait = !hz || interval <= 1000.0 / hz * kLate;
+    }
+    bool tear = !wait && mode != VSync::Fast && tearing_;
+    swap_->Present(wait ? 1 : 0, tear ? DXGI_PRESENT_ALLOW_TEARING : 0);
+}
+
 // XBE_CAPTURE_AT: the next listed time has passed
 bool D3D12Backend::CaptureDue() {
     const auto& at = diag::CaptureAt();
@@ -3604,9 +3624,8 @@ void D3D12Backend::Present(const Surface& front) {
     Submit(false);
     present_fence_[presents_ % (kFrames + 1)].store(fence_value_);
     DeliverReports();
-    bool vsync = app::Get().vsync;
     auto perf_swap = PerfClock::now();
-    swap_->Present(vsync ? 1 : 0, !vsync && tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
+    PresentSwap();
     g_perf.swap += PerfMs(perf_swap);
 
     presents_++;

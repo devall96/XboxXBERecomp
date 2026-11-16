@@ -25,6 +25,7 @@ namespace {
 
 const char* kModes[] = {"fullscreen", "borderless", "windowed"};
 const char* kWide[] = {"console", "off", "expand"};
+const char* kVSync[] = {"off", "on", "adaptive", "fast", "vrr"};
 
 std::filesystem::path File() { return ExeDir() / kGame.settings; }
 
@@ -52,6 +53,11 @@ void Load() {
     s.render_percent = t["render_percent"].value_or(s.render_percent);
     s.fps_cap = t["fps_cap"].value_or(s.fps_cap);
     s.vsync = t["vsync"].value_or(s.vsync);
+    s.vsync_mode = s.vsync ? VSync::On : VSync::Off;
+    std::string vsync = t["vsync_mode"].value_or(std::string(kVSync[uint32_t(s.vsync_mode)]));
+    for (uint32_t i = 0; i < 5; i++)
+        if (vsync == kVSync[i]) s.vsync_mode = VSync(i);
+    s.vsync = s.vsync_mode != VSync::Off;
     s.aniso = t["anisotropic_filtering"].value_or(s.aniso);
     s.custom_textures = t["custom_textures"].value_or(s.custom_textures);
     s.dump_textures = t["dump_textures"].value_or(s.dump_textures);
@@ -86,7 +92,8 @@ toml::table Table() {
                   {"height", int64_t(s.height)},
                   {"render_percent", int64_t(s.render_percent)},
                   {"fps_cap", int64_t(s.fps_cap)},
-                  {"vsync", s.vsync},
+                  {"vsync", s.vsync_mode != VSync::Off},
+                  {"vsync_mode", kVSync[uint32_t(s.vsync_mode)]},
                   {"anisotropic_filtering", int64_t(s.aniso)},
                   {"custom_textures", s.custom_textures},
                   {"dump_textures", s.dump_textures},

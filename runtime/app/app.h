@@ -15,6 +15,14 @@ namespace app {
 
 enum class DisplayMode : uint32_t { Fullscreen, Borderless, Windowed };
 inline constexpr uint32_t kFpsCapRefresh = 1;  // fps_cap: the monitor's refresh rate
+// vsync_mode: how frames meet the display
+enum class VSync : uint32_t {
+    Off,       // present at once, tearing where the display allows it (lowest latency)
+    On,        // wait for the refresh: no tearing, a missed refresh holds the frame a whole one
+    Adaptive,  // on while frames keep up with the refresh, off for a late one (a tear instead of a held frame)
+    Fast,      // no wait and no tearing: the newest finished frame shows at each refresh (borderless and windowed)
+    Vrr,       // for G-Sync and FreeSync: no wait, tearing allowed, the frame rate capped 3 under the refresh rate
+};
 // widescreen: what a wide output gets
 enum class Wide : uint32_t {
     Console,  // the console reports a widescreen TV at 3:2 and wider, and the frame is shown 16:9 (anamorphic)
@@ -27,7 +35,8 @@ struct Settings {
     uint32_t width = 0, height = 0;  // 0 is the desktop mode
     uint32_t render_percent = 100;   // of the output height
     uint32_t fps_cap = 60;           // 0 unlimited, kFpsCapRefresh the monitor's refresh rate
-    bool vsync = true;
+    bool vsync = true;                 // vsync_mode != Off, kept for older settings files
+    VSync vsync_mode = VSync::On;
     uint32_t aniso = 0;              // 0 as the game asks
     bool custom_textures = true;     // images in textures\replacement\ beside the exe replace the game's
     bool dump_textures = false;      // each texture once into textures\dumps\ beside the exe
@@ -138,5 +147,7 @@ extern const GameInfo kGame;
 
 // sleeps out the rest of the frame for the fps cap
 void Pace();
+// the game window's monitor's refresh rate in Hz, 0 when unreadable (read again each second)
+uint32_t RefreshRate();
 
 }  // namespace app
