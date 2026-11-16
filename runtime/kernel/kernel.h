@@ -188,6 +188,8 @@ bool DeleteSymbolicLink(const std::string& link);
 std::string QuerySymbolicLink(const std::string& link);
 std::string ResolvePath(const std::string& xbox_path, uint32_t root_handle);  // host path or empty
 bool ReadGameFile(const std::string& xbox_path, std::vector<uint8_t>& out);  // from a host folder or the disc image
+// the same, past GameInfo::disc_file: the disc's own file, for the game's hook that rewrites it
+bool ReadOriginalGameFile(const std::string& xbox_path, std::vector<uint8_t>& out);
 
 // boot
 bool Boot(std::vector<uint8_t> xbe, const std::string& xbe_name, const std::string& game_dir, const std::string& data_dir);

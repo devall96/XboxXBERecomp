@@ -6,6 +6,7 @@
 #include <fstream>
 #include <map>
 
+#include "app/app.h"
 #include "kernel/disc.h"
 #include "kernel/kernel.h"
 #include "kernel/exports.h"
@@ -230,13 +231,15 @@ struct Target {
     const Disc::Entry* entry = nullptr;  // there: the file or folder, null when missing
 };
 
+thread_local bool t_original = false;  // ReadOriginalGameFile: past GameInfo::disc_file
+
 Target Resolve(const std::string& xbox_path, uint32_t root_handle) {
     std::string p = Normalize(xbox_path);
     if (root_handle) {
         if (auto f = FileFromHandle(root_handle)) p = Normalize(f->xbox + "\\" + p);
     }
     if (p.size() >= 2 && p[1] == ':') p = "\\??\\" + p;
-    std::lock_guard<std::mutex> lock(g_links_lock);
+    std::unique_lock<std::mutex> lock(g_links_lock);
     for (int depth = 0; depth < 8; depth++) {
         std::string up = Upper(p);
         bool changed = false;
@@ -267,9 +270,19 @@ Target Resolve(const std::string& xbox_path, uint32_t root_handle) {
     // no Xbox name holds ':', and fs::path would take "D:" as a host drive
     for (auto& part : parts)
         if (part.find(':') != std::string::npos) return {};
-    if (best->first == kCdRom)
+    // the device's entry copied out, so the game's disc_file hook runs without the lock (it may read files itself)
+    bool cdrom = best->first == kCdRom;
+    fs::path device = best->second;
+    lock.unlock();
+    if (cdrom && app::kGame.disc_file && !t_original) {
+        std::string rel;
+        for (auto& part : parts) rel += (rel.empty() ? "" : "\\") + part;
+        fs::path host;
+        if (app::kGame.disc_file(rel, host)) return {host.string()};
+    }
+    if (cdrom)
         if (const Disc* disc = MountedDisc()) return {{}, true, disc->Find(parts)};
-    return {MatchCase(best->second, parts).string()};
+    return {MatchCase(device, parts).string()};
 }
 
 // a bare name with no device is missing in \??, any longer path misses a folder first
@@ -306,6 +319,13 @@ uint32_t OpenOnDisc(const Disc::Entry* e, const std::string& name, uint32_t hand
 }  // namespace
 
 std::string ResolvePath(const std::string& xbox_path, uint32_t root_handle) { return Resolve(xbox_path, root_handle).host; }
+
+bool ReadOriginalGameFile(const std::string& xbox_path, std::vector<uint8_t>& out) {
+    t_original = true;
+    bool ok = ReadGameFile(xbox_path, out);
+    t_original = false;
+    return ok;
+}
 
 bool ReadGameFile(const std::string& xbox_path, std::vector<uint8_t>& out) {
     Target t = Resolve(xbox_path, 0);

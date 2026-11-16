@@ -157,6 +157,10 @@ struct GameInfo {
     // only the release this executable was made from (and `releases`) starts: another is refused with release_name,
     // the expected SHA-1 and the one found, instead of offered at the player's risk
     bool one_release = false;
+    // a file on the game's disc served from the host instead (a settings file the game reads, rewritten): path is
+    // the disc path ("Game.ini", "map\\hub.mxb"); true with host set takes it; kernel::ReadOriginalGameFile reads
+    // the disc's own
+    bool (*disc_file)(const std::string& path, std::filesystem::path& host) = nullptr;
     const wchar_t* release_name = nullptr;
 };
 extern const GameInfo kGame;
