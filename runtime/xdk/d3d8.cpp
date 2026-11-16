@@ -1837,6 +1837,13 @@ void ApplyPushedSurface() {
                                                                                        : (swizzled ? 0x06 : 0x12);
     uint32_t z_fmt = zeta == 1 ? (swizzled ? 0x2C : 0x30) : (swizzled ? 0x2A : 0x2E);  // D16, else D24S8
     uint32_t c_off = g_state.simple[kMSurfaceColor >> 2], z_off = g_state.simple[kMSurfaceZeta >> 2];
+    // the surface clip bounds what is drawn: Whiplash clips its 640 by 480 back buffer to 448 lines, and the scene
+    // drawn past them showed under its cutscene letterbox (on a TV those lines were overscan)
+    g_state.scissor_count = 1;
+    g_state.scissors[0] = clip_h & 0xFFFF;
+    g_state.scissors[1] = clip_v & 0xFFFF;
+    g_state.scissors[2] = swizzled ? w : (clip_h & 0xFFFF) + (clip_h >> 16);
+    g_state.scissors[3] = swizzled ? h : (clip_v & 0xFFFF) + (clip_v >> 16);
     g_state.rt = SurfaceOf(PushedSurface(c_off, c_fmt, swizzled, w, h, pitches & 0xFFFF));
     g_state.zs = zeta ? SurfaceOf(PushedSurface(z_off, z_fmt, swizzled, w, h, pitches >> 16)) : gpu::Surface{};
 }
