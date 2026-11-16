@@ -1601,7 +1601,9 @@ std::shared_ptr<gpu::VertexShader> PushedVertexShader(uint32_t& stride) {
             uint32_t f = ps.formats[s], type = f & 0xF, size = (f >> 4) & 0xF;
             if (!size) continue;
             vs->inputs[s] = {0, off, (size << 4) | type};
-            off += VertexTypeBytes(type, size);
+            // each attribute takes whole dwords, as the hardware reads an inline array: a 1 byte weight or index
+            // pads to 4 (Whiplash's creatures, 29 bytes of attributes in a 32 byte vertex)
+            off += (VertexTypeBytes(type, size) + 3) & ~3u;
         }
         vs->stream_stride[0] = off;
     }
