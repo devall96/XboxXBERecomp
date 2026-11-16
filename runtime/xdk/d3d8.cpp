@@ -1261,9 +1261,11 @@ uint32_t UpVertices(const void* src, uint32_t bytes) {
     return g_up_header;
 }
 
-void DrawUp(uint32_t prim, uint32_t count, const void* vertices, uint32_t stride, const uint16_t* indices = nullptr) {
+// sync: reload the deferred states from the title's memory first; a pushed draw has already, then set its own on top
+void DrawUp(uint32_t prim, uint32_t count, const void* vertices, uint32_t stride, const uint16_t* indices = nullptr,
+            bool sync = true) {
     if (!g_backend || !count || !stride) return;
-    SyncDeferred();
+    if (sync) SyncDeferred();
     // indexed: count is of indices, the ring takes the vertices up to the highest one
     uint32_t used = indices ? *std::max_element(indices, indices + count) + 1u : count;
     auto stream = g_state.streams[0];
@@ -1488,6 +1490,7 @@ struct PushedState {
     bool formats_set = false;
     std::array<uint32_t, 16> formats{};       // vertex data array format per slot
     std::array<uint32_t, 4> tex_offset{}, tex_format{}, tex_control{};
+    std::array<uint32_t, 4> tex_control1{}, tex_rect{};  // a linear texture's pitch and size
     std::array<uint32_t, 16> offsets{};       // vertex data array offset per slot (physical)
 };
 PushedState g_pushed;
@@ -1508,18 +1511,28 @@ void LogPushedStats() {
 constexpr uint32_t kMExecutionMode = 0x1E94, kMProgramLoad = 0x1E9C, kMProgramStart = 0x1EA0;
 constexpr uint32_t kMProgramData = 0x0B00, kMProgramDataEnd = 0x0B80, kMArrayFormat = 0x1760, kMArrayFormatEnd = 0x17A0;
 constexpr uint32_t kMTexture = 0x1B00, kTexStage = 0x40, kTexOffset = 0, kTexFormat = 4, kTexControl0 = 0xC;
+constexpr uint32_t kTexControl1 = 0x10, kTexImageRect = 0x1C;
 constexpr uint32_t kMShaderStageProgram = 0x1E70;  // the pixel shader's texture modes
 constexpr uint32_t kTexEnable = 0x40000000;
 
-// a texture header in system memory per pushed offset and format
-uint32_t PushedTextureHeader(uint32_t offset, uint32_t format) {
-    static std::map<std::pair<uint32_t, uint32_t>, uint32_t> headers;
-    uint32_t& h = headers[{offset, format}];
+// a texture header in system memory per pushed offset, format and size. A linear format takes its size and pitch from
+// the stage's image rect (width bits 16-31, height 0-15) and control 1 (pitch bits 16-31), in the D3DPixelContainer
+// Size encoding: width - 1 bits 0-11, height - 1 bits 12-23, pitch / 64 - 1 bits 24-31.
+uint32_t PushedTextureHeader(uint32_t offset, uint32_t format, uint32_t control1, uint32_t rect) {
+    const auto& info = gpu::Format((format >> 8) & 0xFF);
+    uint32_t size = 0;
+    if (!info.swizzled && !info.compressed) {
+        uint32_t w = rect >> 16, h = rect & 0xFFFF, pitch = control1 >> 16;
+        if (w && h && pitch >= 64) size = ((w - 1) & 0xFFF) | ((h - 1) & 0xFFF) << 12 | ((pitch / 64 - 1) & 0xFF) << 24;
+    }
+    static std::map<std::tuple<uint32_t, uint32_t, uint32_t>, uint32_t> headers;
+    uint32_t& h = headers[{offset, format, size}];
     if (!h) {
         h = mem::AllocSystem(20);
         W32(h, 0x00040001);  // a texture, one reference
         W32(h + 4, offset);
         W32(h + 12, format);
+        W32(h + 16, size);
     }
     return h;
 }
@@ -1550,6 +1563,8 @@ bool ApplyPushedState(uint32_t m, uint32_t v) {
         if (r == kTexOffset) ps.tex_offset[s] = v;
         if (r == kTexFormat) ps.tex_format[s] = v;
         if (r == kTexControl0) ps.tex_control[s] = v;
+        if (r == kTexControl1) ps.tex_control1[s] = v;
+        if (r == kTexImageRect) ps.tex_rect[s] = v;
     }
     return false;
 }
@@ -1679,22 +1694,74 @@ bool DrawPushed(uint32_t prim, const std::vector<uint32_t>& vertices) {
     LOG_FIRST(4, "d3d: pushed draw prim %u, %u vertices of %u bytes, program %u, tex0 %08X/%08X, combiners %u", prim,
               bytes / stride, stride, uint32_t(vs->program.size() / 4), g_pushed.tex_offset[0], g_pushed.tex_format[0],
               g_state.simple[gpu::kMPsCombinerCount >> 2] & 0xFF);
+    // the deferred states first, so the pushed ones below are not overwritten by DrawUp's sync (stage addressing, fog)
+    SyncDeferred();
     auto saved_vs = g_state.vs;
     auto saved_ps = g_state.ps;
     uint32_t saved_handle = g_state.vs_handle;
     auto saved_textures = g_state.textures;
+    // fog comes from the pushed registers, not the D3D render states an earlier API call left: a vertex program that
+    // writes no fog under a stale fog enable fogs every pixel to the fog colour (Whiplash's opening text went black)
+    constexpr uint32_t kMFogEnable = 0x2A4, kMFogColor = 0x2A8;
+    uint32_t saved_fog = g_state.rs[gpu::kRsFogEnable], saved_fog_color = g_state.rs[gpu::kRsFogColor];
+    uint32_t fc = g_state.simple[kMFogColor >> 2];  // ABGR, D3D's is ARGB
+    g_state.rs[gpu::kRsFogEnable] = g_state.simple[kMFogEnable >> 2] ? 1 : 0;
+    g_state.rs[gpu::kRsFogColor] = (fc & 0xFF00FF00) | ((fc & 0xFF) << 16) | ((fc >> 16) & 0xFF);
+    // texture addressing and filtering from the pushed stage registers, not the D3D stage states (Whiplash's font
+    // wraps: its coordinates run past 1, and clamped it samples the transparent edge)
+    constexpr uint32_t kTexAddress = 0x08, kTexFilter = 0x14;
+    auto saved_tss = g_state.tss;
+    for (uint32_t s = 0; s < 4; s++) {
+        uint32_t address = g_state.simple[(kMTexture + s * kTexStage + kTexAddress) >> 2];
+        uint32_t filter = g_state.simple[(kMTexture + s * kTexStage + kTexFilter) >> 2];
+        auto& t = g_state.tss[s];
+        // NV2A address modes match D3DTADDRESS: 1 wrap, 2 mirror, 3 clamp to edge, 4 border
+        if (address & 0xF) t[gpu::kTssAddressU] = address & 0xF;
+        if (address >> 8 & 0xF) t[gpu::kTssAddressV] = address >> 8 & 0xF;
+        if (address >> 16 & 0xF) t[gpu::kTssAddressW] = address >> 16 & 0xF;
+        // minification 1..6: nearest, linear, then nearest/linear within the nearest or between two mip levels
+        static const uint32_t kMin[7][2] = {{0, 0}, {1, 0}, {2, 0}, {1, 1}, {2, 1}, {1, 2}, {2, 2}};
+        uint32_t mn = filter >> 16 & 0xFF, mg = filter >> 24 & 0xFF;
+        if (mn >= 1 && mn <= 6) {
+            t[gpu::kTssMinFilter] = kMin[mn][0];
+            t[gpu::kTssMipFilter] = kMin[mn][1];
+        }
+        if (mg) t[gpu::kTssMagFilter] = mg == 1 ? 1 : 2;  // nearest, else linear
+    }
+    // bring-up switch: UNCHAINED_PB_NODEPTH draws pushed primitives without the depth test
+    static const bool no_depth = std::getenv("UNCHAINED_PB_NODEPTH") != nullptr;
+    constexpr uint32_t kMDepthTest = 0x30C;
+    // the depth test's enable is a D3D render state to the renderer (1 z, 2 w buffer); a pushed draw takes it from the
+    // pushed register, keeping a w buffer the title chose through the API
+    uint32_t saved_depth = g_state.rs[gpu::kRsZEnable];
+    uint32_t pushed_depth = g_state.simple[kMDepthTest >> 2] ? (saved_depth ? saved_depth : 1u) : 0u;
+    g_state.rs[gpu::kRsZEnable] = no_depth ? 0 : pushed_depth;
+    // bring-up switch: UNCHAINED_PB_NOBLEND draws pushed primitives without blending
+    static const bool no_blend = std::getenv("UNCHAINED_PB_NOBLEND") != nullptr;
+    constexpr uint32_t kMBlendEnable = 0x304;
+    uint32_t saved_blend = g_state.simple[kMBlendEnable >> 2];
+    if (no_blend) g_state.simple[kMBlendEnable >> 2] = 0;
     g_state.vs = vs;
     g_state.vs_handle = g_pushed.programmable ? vs->handle : (vs->handle & ~1u);
-    if (auto ps = PushedPixelShader()) g_state.ps = ps;
+    // bring-up switch: UNCHAINED_PB_NOPS draws pushed primitives with the texture stages instead of the pushed combiners
+    static const bool no_ps = std::getenv("UNCHAINED_PB_NOPS") != nullptr;
+    if (no_ps) g_state.ps = nullptr;
+    else if (auto ps = PushedPixelShader()) g_state.ps = ps;
     for (uint32_t s = 0; s < 4; s++)
         g_state.textures[s] = g_pushed.tex_control[s] & kTexEnable && g_pushed.tex_format[s]
-                                  ? PushedTextureHeader(g_pushed.tex_offset[s], g_pushed.tex_format[s])
+                                  ? PushedTextureHeader(g_pushed.tex_offset[s], g_pushed.tex_format[s],
+                                                        g_pushed.tex_control1[s], g_pushed.tex_rect[s])
                                   : 0;
-    DrawUp(prim, bytes / stride, vertices.data(), stride);
+    DrawUp(prim, bytes / stride, vertices.data(), stride, nullptr, false);
     g_state.vs = saved_vs;
     g_state.ps = saved_ps;
     g_state.vs_handle = saved_handle;
     g_state.textures = saved_textures;
+    g_state.rs[gpu::kRsFogEnable] = saved_fog;
+    g_state.rs[gpu::kRsFogColor] = saved_fog_color;
+    g_state.tss = saved_tss;
+    g_state.rs[gpu::kRsZEnable] = saved_depth;
+    g_state.simple[kMBlendEnable >> 2] = saved_blend;
     return true;
 }
 }  // namespace
@@ -1721,11 +1788,14 @@ static void RunCommands(uint32_t begin, uint32_t end) {
     constexpr uint32_t kReturn = 0x00020000;
     uint32_t returns[4], depth = 0, budget = 1u << 22;
     auto in_buffer = [&](uint32_t q) { return q >= begin && q < end; };
-    // UNCHAINED_PB_DUMP set: the first two runs' commands go to pbdump.txt (bring-up of the push buffer interpreter)
+    // UNCHAINED_PB_DUMP=N: the commands of the (N+1)th non-empty run (and the one after) go to pbdump.txt (bring-up of
+    // the push buffer interpreter); 0 or empty dumps the first two
     static int dumps = std::getenv("UNCHAINED_PB_DUMP") ? 2 : 0;
+    static int skip = std::getenv("UNCHAINED_PB_DUMP") ? std::atoi(std::getenv("UNCHAINED_PB_DUMP")) : 0;
     static FILE* dump = nullptr;
-    if (dumps && !dump) dump = std::fopen("pbdump.txt", "w");
-    FILE* df = dumps > 0 && begin < end ? dump : nullptr;
+    if (dumps && skip > 0 && begin < end) skip--;
+    if (dumps && !skip && !dump) dump = std::fopen("pbdump.txt", "w");
+    FILE* df = dumps > 0 && !skip && begin < end ? dump : nullptr;
     if (df) std::fprintf(df, "run %08X..%08X\n", begin, end);
     for (uint32_t p = begin; begin && p != end && budget; budget--) {
         if (in_buffer(p) && p + 4 > end) break;
@@ -1733,7 +1803,10 @@ static void RunCommands(uint32_t begin, uint32_t end) {
         uint32_t head = R32(p), method = head & 0x1FFC, n = (head >> 18) & 0x7FF;
         if (df) {
             std::fprintf(df, "%08X %08X m %04X n %u%s", p, head, method, n, head & 0x40000000 ? " ni" : "");
-            for (uint32_t i = 0; i < std::min<uint32_t>(n, 8) && !(head & 0xA0030003); i++)
+            // constants and short inline arrays in full
+            bool full = (method >= 0x0B80 && method < 0x0C00) || (method == kInlineArray && n <= 600);
+            uint32_t shown = full ? n : std::min<uint32_t>(n, 8);
+            for (uint32_t i = 0; i < shown && !(head & 0xA0030003); i++)
                 std::fprintf(df, " %08X", R32(p + 4 + i * 4));
             std::fprintf(df, "\n");
         }
