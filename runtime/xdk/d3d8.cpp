@@ -1755,9 +1755,18 @@ bool DrawPushed(uint32_t prim, const std::vector<uint32_t>& vertices) {
         g_state.ps = ps;
         g_state.rs[gpu::kRsPsTextureModes] = g_state.simple[kMShaderStageProgram >> 2];
     }
+    // a frame buffer read as a texture is the one being drawn: the title pushes the address it was given at the start,
+    // which the console's push buffer fixups would patch, and Swap rotates the buffers' memory (Whiplash's hyper mode
+    // copied the shown frame, without its character mask, every other frame)
+    auto frame_read = [](uint32_t offset) {
+        uint32_t rt = Dev(kDevRenderTarget);
+        for (uint32_t h : g_buffers)
+            if (h && rt && (R32(h + 4) & 0x7FFFFFFF) == (offset & 0x7FFFFFFF)) return R32(rt + 4);
+        return offset;
+    };
     for (uint32_t s = 0; s < 4; s++)
         g_state.textures[s] = g_pushed.tex_control[s] & kTexEnable && g_pushed.tex_format[s]
-                                  ? PushedTextureHeader(g_pushed.tex_offset[s], g_pushed.tex_format[s],
+                                  ? PushedTextureHeader(frame_read(g_pushed.tex_offset[s]), g_pushed.tex_format[s],
                                                         g_pushed.tex_control1[s], g_pushed.tex_rect[s])
                                   : 0;
     DrawUp(prim, bytes / stride, vertices.data(), stride, nullptr, false);
