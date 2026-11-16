@@ -1768,6 +1768,93 @@ bool DrawPushed(uint32_t prim, const std::vector<uint32_t>& vertices) {
 }
 }  // namespace
 
+// Render targets a title switches in its own push buffer (Whiplash draws its characters' shadows into a 256 by 256
+// texture so, then back to the back buffer): the surface methods name the colour and depth memory, their size and
+// layout. Memory of the device's own surfaces keeps their headers; any other gets a header made for it once, so the
+// renderer keys a target on that memory and a texture laid on it samples what was drawn.
+namespace {
+constexpr uint32_t kMSurfaceClipH = 0x200, kMSurfaceClipV = 0x204, kMSurfaceFormat = 0x208;
+constexpr uint32_t kMSurfaceColor = 0x210, kMSurfaceZeta = 0x214;
+constexpr uint32_t kMClearZeta = 0x1D8C, kMClearColor = 0x1D90, kMClearSurface = 0x1D94;
+constexpr uint32_t kMClearRectH = 0x1D98, kMClearRectV = 0x1D9C;
+bool g_surface_dirty = false;
+std::map<std::array<uint32_t, 4>, uint32_t> g_pushed_surfaces;  // (offset, D3D format, width, height): header
+
+// the device surface for memory at this physical offset, else 0. Any frame buffer's memory is the device's render
+// target: Swap rotates the buffers' memory, and a title that pushes the address it was given at the start (Whiplash)
+// names the front buffer every other frame; drawing there showed every other picture empty, a strobe.
+uint32_t DeviceSurfaceAt(uint32_t offset) {
+    auto at = [&](uint32_t h) { return h && (R32(h + 4) & 0x7FFFFFFF) == (offset & 0x7FFFFFFF); };
+    for (uint32_t h : {Dev(kDevRenderTarget), g_buffers[0], g_buffers[1], g_buffers[2]})
+        if (at(h)) return Dev(kDevRenderTarget);
+    for (uint32_t h : {Dev(kDevDepth), g_depth})
+        if (at(h)) return Dev(kDevDepth);
+    return 0;
+}
+
+uint32_t PushedSurface(uint32_t offset, uint32_t d3d_fmt, bool swizzled, uint32_t w, uint32_t h, uint32_t pitch) {
+    // a swizzled surface laid on a device surface's memory (Whiplash's shadow depth on the depth buffer's) is its own
+    if (uint32_t dev = swizzled ? 0 : DeviceSurfaceAt(offset)) {
+        uint32_t dw, dh;
+        gpu::SurfaceSize(SurfaceOf(dev), dw, dh);
+        if (dw >= w && dh >= h) return dev;  // the device's own surface (the back buffer's 640 by 448 part of 640 by 480)
+    }
+    auto& hdr = g_pushed_surfaces[{offset, d3d_fmt, w, h}];
+    if (!hdr) {
+        hdr = mem::AllocSystem(24);
+        auto log2 = [](uint32_t v) { uint32_t l = 0; while ((1u << l) < v) l++; return l; };
+        W32(hdr + 0, 0x00050001);  // surface, one reference
+        W32(hdr + 4, offset);
+        W32(hdr + 8, 0);
+        if (swizzled) {
+            W32(hdr + 12, 0x00010021 | d3d_fmt << 8 | log2(w) << 20 | log2(h) << 24);
+            W32(hdr + 16, 0);
+        } else {
+            W32(hdr + 12, 0x00010021 | d3d_fmt << 8);
+            W32(hdr + 16, (w - 1) | (h - 1) << 12 | (std::max(pitch, 64u) / 64 - 1) << 24);
+        }
+        LOGI("d3d: pushed render target %08X, %ux%u, format %02X%s", offset, w, h, d3d_fmt, swizzled ? " swizzled" : "");
+    }
+    return hdr;
+}
+
+// the surface methods pushed since the last draw or clear become the bound targets
+void ApplyPushedSurface() {
+    if (!g_surface_dirty) return;
+    g_surface_dirty = false;
+    uint32_t clip_h = g_state.simple[kMSurfaceClipH >> 2], clip_v = g_state.simple[kMSurfaceClipV >> 2];
+    uint32_t fmt = g_state.simple[kMSurfaceFormat >> 2], pitches = g_state.simple[(kMSurfaceFormat + 4) >> 2];
+    uint32_t w = (clip_h >> 16) + (clip_h & 0xFFFF), h = (clip_v >> 16) + (clip_v & 0xFFFF);
+    if (!w || !h) return;
+    bool swizzled = (fmt >> 8 & 0xF) == 2;
+    if (swizzled) {  // a swizzled surface's size is its log2 width and height
+        w = 1u << (fmt >> 16 & 0xFF);
+        h = 1u << (fmt >> 24 & 0xFF);
+    }
+    // NV2A colour formats 3 R5G6B5, 4 and 5 X8R8G8B8, 8 A8R8G8B8; D3D's swizzled and linear codes
+    uint32_t color = fmt & 0xF, zeta = fmt >> 4 & 0xF;
+    uint32_t c_fmt = color == 3 ? (swizzled ? 0x05 : 0x11) : color == 4 || color == 5 ? (swizzled ? 0x07 : 0x1E)
+                                                                                       : (swizzled ? 0x06 : 0x12);
+    uint32_t z_fmt = zeta == 1 ? (swizzled ? 0x2C : 0x30) : (swizzled ? 0x2A : 0x2E);  // D16, else D24S8
+    uint32_t c_off = g_state.simple[kMSurfaceColor >> 2], z_off = g_state.simple[kMSurfaceZeta >> 2];
+    g_state.rt = SurfaceOf(PushedSurface(c_off, c_fmt, swizzled, w, h, pitches & 0xFFFF));
+    g_state.zs = zeta ? SurfaceOf(PushedSurface(z_off, z_fmt, swizzled, w, h, pitches >> 16)) : gpu::Surface{};
+}
+
+// a pushed clear: the clear rectangle (inclusive edges), the colour and depth values, the planes asked for
+void PushedClear(uint32_t flags) {
+    ApplyPushedSurface();
+    if (!g_backend) return;
+    uint32_t rh = g_state.simple[kMClearRectH >> 2], rv = g_state.simple[kMClearRectV >> 2];
+    int32_t rect[4] = {int32_t(rh & 0xFFFF), int32_t(rv & 0xFFFF), int32_t((rh >> 16) + 1), int32_t((rv >> 16) + 1)};
+    uint32_t zv = g_state.simple[kMClearZeta >> 2];
+    bool d16 = (g_state.simple[kMSurfaceFormat >> 2] >> 4 & 0xF) == 1;
+    float z = d16 ? (zv & 0xFFFF) / 65535.0f : (zv >> 8) / 16777215.0f;
+    g_backend->Clear(g_state, 1, reinterpret_cast<const uint8_t*>(rect), flags & 0xF3, g_state.simple[kMClearColor >> 2],
+                     z, zv & 0xFF);
+}
+}  // namespace
+
 // a primitive whose vertices came as an inline array, in the bound vertex format
 static void DrawInline(uint32_t prim, const std::vector<uint32_t>& vertices) {
     if (DrawPushed(prim, vertices)) return;
@@ -1836,7 +1923,13 @@ static void RunCommands(uint32_t begin, uint32_t end) {
             ApplyVisibilityMethod(m, v);
             if (m == kInlineArray) {
                 if (prim) vertices.push_back(v);
+            } else if (m >= kMSurfaceClipH && m <= kMSurfaceZeta) {
+                SetSimple(m, v);
+                g_surface_dirty = true;
+            } else if (m == kMClearSurface) {
+                PushedClear(v);
             } else if (m == kBeginEnd) {
+                if (v) ApplyPushedSurface();
                 if (!v && prim) {
                     if (!indices.empty()) DrawPushedArrays(prim, indices);
                     else if (!vertices.empty()) DrawInline(prim, vertices);
