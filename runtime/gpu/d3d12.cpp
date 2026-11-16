@@ -1872,6 +1872,22 @@ void D3D12Backend::ChooseDrawSide(bool writes_depth) {
             }
         if (inside) break;
     }
+    // a centred piece beside another on its row (a selector's arrows beside its word) moves up or down with it
+    constexpr float kBeside = 16.0f;
+    for (const auto* list : {&sided_, &prev_sided_}) {
+        if (inside || draw_side_ != 0) break;
+        for (const SidedPiece& p : *list) {
+            float overlap = std::min(bottom, p.bottom) - std::max(top, p.top);
+            float shorter = std::min(bottom - top, p.bottom - p.top);
+            float gap = std::max(p.lo - hi, lo - p.hi);
+            if (p.side == 0 && shorter > 0 && overlap >= shorter * 0.5f && gap <= kBeside) {
+                draw_vside_ = p.vside;
+                draw_dy_ = p.dy;
+                inside = true;
+                break;
+            }
+        }
+    }
     constexpr size_t kMaxPieces = 256;
     // a carrier is HUD sized: at most 55% of the width (a health box is half) and a quarter of the height (a screen
     // frame's side line is not)
