@@ -52,6 +52,10 @@ struct Settings {
     std::string colour_lut;            // a .cube file in luts\ in the data folder, empty for none
     uint32_t upscaler = 1;             // 0 bilinear, 1 AMD FSR 1 (EASU) when the view renders smaller than it shows
     uint32_t sharpen = 0;              // 0 off, to 100: FSR 1's RCAS, 2 stops (100 the sharpest)
+    // HDR10 output where Windows has the display in HDR: the picture's white at hdr_paper_white nits, its brightest
+    // parts stretched toward hdr_peak (0 the display's own) by hdr_highlights percent
+    bool hdr = false;
+    uint32_t hdr_paper_white = 200, hdr_peak = 0, hdr_highlights = 50;
     // colour grading of the presented picture: exposure in hundredths of a stop, contrast and saturation in percent,
     // temperature and tint -100 to 100
     int32_t grade_exposure = 0;
@@ -192,5 +196,11 @@ extern const GameInfo kGame;
 void Pace();
 // the game window's monitor's refresh rate in Hz, 0 when unreadable (read again each second)
 uint32_t RefreshRate();
+// the monitor a window is on (nullptr: the primary): whether Windows drives it in HDR, and its peak brightness
+struct HdrInfo {
+    bool hdr = false;
+    float max_nits = 0;
+};
+HdrInfo HdrDisplay(void* hwnd);
 
 }  // namespace app

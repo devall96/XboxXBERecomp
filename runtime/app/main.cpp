@@ -8,6 +8,7 @@
 #include <windows.h>
 #include <dbghelp.h>
 #include <timeapi.h>
+#include <dxgi1_6.h>
 
 #include <algorithm>
 #include <chrono>
@@ -233,6 +234,32 @@ uint32_t RefreshRate() {
                    : 0;
     }
     return rate;
+}
+
+HdrInfo HdrDisplay(void* hwnd) {
+    HdrInfo info;
+    HMONITOR mon = MonitorFromWindow(static_cast<HWND>(hwnd), MONITOR_DEFAULTTOPRIMARY);
+    IDXGIFactory1* f = nullptr;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&f)))) return info;
+    IDXGIAdapter1* a = nullptr;
+    bool found = false;
+    for (UINT i = 0; !found && f->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
+        IDXGIOutput* o = nullptr;
+        for (UINT j = 0; !found && a->EnumOutputs(j, &o) != DXGI_ERROR_NOT_FOUND; j++) {
+            IDXGIOutput6* o6 = nullptr;
+            DXGI_OUTPUT_DESC1 d{};
+            if (SUCCEEDED(o->QueryInterface(IID_PPV_ARGS(&o6))) && SUCCEEDED(o6->GetDesc1(&d)) && d.Monitor == mon) {
+                found = true;
+                info.hdr = d.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+                info.max_nits = d.MaxLuminance;
+            }
+            if (o6) o6->Release();
+            o->Release();
+        }
+        a->Release();
+    }
+    f->Release();
+    return info;
 }
 
 void Pace() {

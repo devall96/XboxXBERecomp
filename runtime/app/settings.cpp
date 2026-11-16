@@ -78,6 +78,10 @@ void Load() {
     s.colour_filter_strength = std::min(t["colour_filter_strength"].value_or(s.colour_filter_strength), 200u);
     s.colour_lut = t["colour_lut"].value_or(s.colour_lut);
     s.sharpen = std::min(t["sharpen"].value_or(s.sharpen), 100u);
+    s.hdr = t["hdr"].value_or(s.hdr);
+    s.hdr_paper_white = std::clamp(t["hdr_paper_white"].value_or(s.hdr_paper_white), 80u, 500u);
+    s.hdr_peak = std::min(t["hdr_peak"].value_or(s.hdr_peak), 10000u);
+    s.hdr_highlights = std::min(t["hdr_highlights"].value_or(s.hdr_highlights), 100u);
     s.grade_exposure = std::clamp(t["grade_exposure"].value_or(s.grade_exposure), -300, 300);
     s.grade_contrast = std::clamp(t["grade_contrast"].value_or(s.grade_contrast), 50u, 200u);
     s.grade_saturation = std::min(t["grade_saturation"].value_or(s.grade_saturation), 200u);
@@ -119,6 +123,10 @@ toml::table Table() {
                   {"colour_filter_strength", int64_t(s.colour_filter_strength)},
                   {"colour_lut", s.colour_lut},
                   {"sharpen", int64_t(s.sharpen)},
+                  {"hdr", s.hdr},
+                  {"hdr_paper_white", int64_t(s.hdr_paper_white)},
+                  {"hdr_peak", int64_t(s.hdr_peak)},
+                  {"hdr_highlights", int64_t(s.hdr_highlights)},
                   {"grade_exposure", int64_t(s.grade_exposure)},
                   {"grade_contrast", int64_t(s.grade_contrast)},
                   {"grade_saturation", int64_t(s.grade_saturation)},

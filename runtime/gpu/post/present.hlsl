@@ -3,6 +3,7 @@
 // needs neither the headers nor a compile at start.
 //   ps_easu   EASU, edge-adaptive upscaling of the shown view to the output's size (when rendered smaller)
 //   ps_final  RCAS sharpening, the console's gamma ramp and colour grading, into the swap chain's buffer
+//   ps_hdr    the finished SDR picture to HDR10 (Rec. 2020 primaries, SMPTE ST 2084 PQ) for an HDR display
 #define A_GPU 1
 #define A_HLSL 1
 #include "../../../third_party/fsr1/ffx_a.h"
@@ -17,7 +18,8 @@ cbuffer P : register(b1) {
     uint4 con1;
     uint4 con2;
     uint4 con3;
-    float4 opts;   // final: x sharpen, y gamma ramp, zw the viewport's top left in the target
+    float4 opts;   // final: x sharpen, y gamma ramp, zw the viewport's top left in the target; hdr: x paper white
+                   // nits, y peak nits, z highlights 0 to 1
     float4 grade0; // exposure (stops), contrast, saturation, 1 to grade
     float4 grade1; // temperature, tint (-1 to 1)
     float4 filter; // x colour vision filter: 0 none, 1 protanopia, 2 deuteranopia, 3 tritanopia; y strength;
@@ -69,6 +71,21 @@ float3 Daltonize(float3 c, int kind) {
     float3 err = c - mul(to_rgb, lms);
     float3 shift = float3(0, 0.7 * err.r + err.g, 0.7 * err.r + err.b);
     return saturate(c + shift * filter.y);
+}
+
+float4 ps_hdr(float4 pos : SV_Position) : SV_Target {
+    float3 c = pow(saturate(img.Load(int3(pos.xy, 0)).rgb), 2.2);  // a TV's gamma to linear light
+    // highlights: the top of the SDR range stretched toward the peak, the midtones left at paper white's level
+    float y = dot(c, float3(0.2126, 0.7152, 0.0722));
+    float y2 = y * y;
+    c *= 1 + opts.z * (opts.y / opts.x - 1) * y2 * y2;
+    const float3x3 to2020 = float3x3(0.6274040, 0.3292820, 0.0433136, 0.0690970, 0.9195400, 0.0113612, 0.0163916,
+                                     0.0880132, 0.8955950);
+    float3 n = min(mul(to2020, c) * opts.x, opts.y) / 10000;
+    // SMPTE ST 2084
+    const float m1 = 0.1593017578125, m2 = 78.84375, c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;
+    float3 p = pow(max(n, 0), m1);
+    return float4(pow((c1 + c2 * p) / (1 + c3 * p), m2), 1);
 }
 
 float4 ps_final(float4 pos : SV_Position) : SV_Target {

@@ -689,6 +689,20 @@ private:
     FILE* frame_times_ = nullptr;
     ComPtr<ID3D12PipelineState> easu_pso_, final_pso_;
     bool present_failed_ = false;
+    // HDR10: the frame and the UI drawn to sdr_ as always, then sdr_ to the 10 bit PQ swap chain (ps_hdr)
+    bool hdr_ = false, hdr_drawn_ = false, hdr_told_ = false;
+    ULONGLONG hdr_next_ = 0;
+    float hdr_max_nits_ = 0;
+    DXGI_FORMAT bb_fmt_ = DXGI_FORMAT_B8G8R8A8_UNORM;
+    ComPtr<ID3D12Resource> sdr_;
+    D3D12_RESOURCE_STATES sdr_state_ = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    uint32_t sdr_w_ = 0, sdr_h_ = 0;
+    ComPtr<ID3D12PipelineState> hdr_pso_;
+    D3D12_CPU_DESCRIPTOR_HANDLE frame_rtv_{};
+    void UpdateHdr();
+    bool EnsureSdr();
+    void HdrPass(uint32_t bi);
+    bool ReadShown(uint32_t bi, std::vector<uint8_t>& px);
     ComPtr<ID3D12Resource> mid_;
     D3D12_RESOURCE_STATES mid_state_ = D3D12_RESOURCE_STATE_RENDER_TARGET;
     uint32_t mid_w_ = 0, mid_h_ = 0;
@@ -1034,7 +1048,7 @@ void D3D12Backend::CreateBackBufferViews() {
 void D3D12Backend::CreateHeaps() {
     srv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kSrvCount, true, srv_heap_);
     smp_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, kSamplerCount, true, smp_heap_);
-    rtv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kRtvCount + kFrames + 1, false, rtv_heap_);
+    rtv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kRtvCount + kFrames + 2, false, rtv_heap_);
     dsv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_DSV, kDsvCount, false, dsv_heap_);
     CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true, ui_heap_);
     for (uint32_t i = kRtvCount; i-- > 0;) free_rtv_.push_back(i);
@@ -3522,7 +3536,7 @@ void D3D12Backend::ResizeSwap() {
         if (f.fence) WaitFence(f.fence);
     }
     for (auto& b : bb_) b.Reset();
-    swap_->ResizeBuffers(kFrames, w, h, DXGI_FORMAT_B8G8R8A8_UNORM, tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
+    swap_->ResizeBuffers(kFrames, w, h, bb_fmt_, tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
     CreateBackBufferViews();
     bb_w_ = w;
     bb_h_ = h;
@@ -3666,7 +3680,8 @@ bool D3D12Backend::EnsurePresentPipelines() {
     ComPtr<ID3DBlob> vs = blob(kPresentVs, sizeof(kPresentVs));
     ComPtr<ID3DBlob> easu = blob(kPresentEasu, sizeof(kPresentEasu));
     ComPtr<ID3DBlob> fin = blob(kPresentFinal, sizeof(kPresentFinal));
-    if (!vs || !easu || !fin) return false;
+    ComPtr<ID3DBlob> hdr = blob(kPresentHdr, sizeof(kPresentHdr));
+    if (!vs || !easu || !fin || !hdr) return false;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d = FullScreenPipelineDesc(vs.Get(), easu.Get(), kBgra);
     if (FAILED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&easu_pso_)))) {
         LOGE("d3d12: FSR 1 EASU pipeline failed");
@@ -3678,6 +3693,8 @@ bool D3D12Backend::EnsurePresentPipelines() {
         easu_pso_.Reset();
         return false;
     }
+    d = FullScreenPipelineDesc(vs.Get(), hdr.Get(), DXGI_FORMAT_R10G10B10A2_UNORM);
+    if (FAILED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&hdr_pso_)))) LOGW("d3d12: no HDR10 pipeline");
     present_failed_ = false;
     return true;
 }
@@ -3800,7 +3817,7 @@ bool D3D12Backend::PresentPost(Target& t, const float uv[4], const D3D12_VIEWPOR
     bool clut = EnsureColourLut();
     if (!upscale && !st.sharpen && !grade && !filter && !clut) return false;
     if (!dw || !dh || !EnsurePresentPipelines() || !EnsureMid(dw, dh)) return false;
-    D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv = Cpu(rtv_heap_.Get(), kRtvCount + swap_->GetCurrentBackBufferIndex(), rtv_inc_);
+    D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv = frame_rtv_;
 
     // the view to mid_: EASU upscaling, else the plain filter (a box of taps where it shrinks)
     Transition(mid_.Get(), mid_state_, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -3865,15 +3882,129 @@ void D3D12Backend::RenderUi() {
 
 void D3D12Backend::DrawFrame(Target* t, uint32_t bi) {
     D3D12_RESOURCE_STATES bs = D3D12_RESOURCE_STATE_PRESENT;
-    Transition(bb_[bi].Get(), bs, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    D3D12_CPU_DESCRIPTOR_HANDLE rh = Cpu(rtv_heap_.Get(), kRtvCount + bi, rtv_inc_);
+    hdr_drawn_ = hdr_ && EnsurePresentPipelines() && EnsureSdr();
+    D3D12_CPU_DESCRIPTOR_HANDLE rh;
+    if (hdr_drawn_) {
+        Transition(sdr_.Get(), sdr_state_, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        rh = Cpu(rtv_heap_.Get(), kRtvCount + kFrames + 1, rtv_inc_);
+    } else {
+        Transition(bb_[bi].Get(), bs, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        rh = Cpu(rtv_heap_.Get(), kRtvCount + bi, rtv_inc_);
+    }
+    frame_rtv_ = rh;
     float black[4] = {0, 0, 0, 1};
     cl_->ClearRenderTargetView(rh, black, 0, nullptr);
     cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
     bound_rt_ = bound_ds_ = nullptr;
     if (t) BlitFrame(*t);
     RenderUi();
+    if (hdr_drawn_) {
+        Transition(bb_[bi].Get(), bs, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        HdrPass(bi);
+    }
     Transition(bb_[bi].Get(), bs, D3D12_RESOURCE_STATE_PRESENT);
+}
+
+// sdr_: the frame and the UI before HDR10's pass, the back buffer's size, its view the RTV heap's last slot
+bool D3D12Backend::EnsureSdr() {
+    if (sdr_ && sdr_w_ == bb_w_ && sdr_h_ == bb_h_) return true;
+    if (sdr_) CurrentFrame().garbage.push_back(sdr_);
+    sdr_.Reset();
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC td = Texture2DDesc(kBgra, bb_w_, bb_h_);
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    D3D12_CLEAR_VALUE cv{};
+    cv.Format = kBgra;
+    sdr_state_ = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, sdr_state_, &cv, IID_PPV_ARGS(&sdr_))))
+        return false;
+    dev_->CreateRenderTargetView(sdr_.Get(), nullptr, Cpu(rtv_heap_.Get(), kRtvCount + kFrames + 1, rtv_inc_));
+    sdr_w_ = bb_w_;
+    sdr_h_ = bb_h_;
+    return true;
+}
+
+// sdr_ to the back buffer in HDR10 (Rec. 2020, PQ): white at paper white, highlights stretched toward the peak
+void D3D12Backend::HdrPass(uint32_t bi) {
+    const app::Settings& st = app::Get();
+    Transition(sdr_.Get(), sdr_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    // RenderUi left ImGui's heaps and root signature bound
+    Begin();
+    D3D12_CPU_DESCRIPTOR_HANDLE rh = Cpu(rtv_heap_.Get(), kRtvCount + bi, rtv_inc_);
+    cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
+    D3D12_VIEWPORT vp{0, 0, float(bb_w_), float(bb_h_), 0, 1};
+    D3D12_RECT scissor{0, 0, LONG(bb_w_), LONG(bb_h_)};
+    cl_->RSSetViewports(1, &vp);
+    cl_->RSSetScissorRects(1, &scissor);
+    uint32_t slot = PresentViews(sdr_.Get(), kBgra);
+    constexpr float kDefaultPeak = 1000.0f;  // a display that reports no peak
+    float paper = float(st.hdr_paper_white);
+    float peak = st.hdr_peak ? float(st.hdr_peak) : hdr_max_nits_ > 0 ? hdr_max_nits_ : kDefaultPeak;
+    struct {
+        AU1 con[16];
+        float opts[4];
+    } p{};
+    p.opts[0] = paper;
+    p.opts[1] = std::max(peak, paper);
+    p.opts[2] = st.hdr_highlights / 100.0f;
+    Alloc cb = Upload(256, 256);
+    std::memcpy(cb.cpu, &p, sizeof(p));
+    DrawFullScreen(hdr_pso_.Get(), cb.gpu, slot);
+}
+
+// app::Settings::hdr and Windows' HDR on the window's display, checked each second: the swap chain switched between
+// 8 bit sRGB and 10 bit HDR10 when they change
+void D3D12Backend::UpdateHdr() {
+    ULONGLONG now = GetTickCount64();
+    if (now < hdr_next_) return;
+    constexpr ULONGLONG kCheckMs = 1000;
+    hdr_next_ = now + kCheckMs;
+    bool want = false;
+    if (app::Get().hdr) {
+        app::HdrInfo info = app::HdrDisplay(app::Window());
+        hdr_max_nits_ = info.max_nits;
+        UINT support = 0;
+        want = info.hdr && EnsurePresentPipelines() && hdr_pso_ &&
+               SUCCEEDED(swap_->CheckColorSpaceSupport(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, &support)) &&
+               (support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT);
+        if (!want && !hdr_told_) LOGI("d3d12: HDR asked, but Windows has this display in SDR (it reports a %.0f nit peak): SDR output", hdr_max_nits_);
+        hdr_told_ = !want;
+    }
+    if (want == hdr_) return;
+    Flush();
+    for (auto& f : frames_) {
+        if (f.fence) WaitFence(f.fence);
+    }
+    for (auto& b : bb_) b.Reset();
+    DXGI_FORMAT fmt = want ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
+    if (FAILED(swap_->ResizeBuffers(kFrames, bb_w_, bb_h_, fmt, tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0))) {
+        LOGW("d3d12: the swap chain stays %s", hdr_ ? "HDR10" : "SDR");
+        CreateBackBufferViews();
+        return;
+    }
+    swap_->SetColorSpace1(want ? DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+    CreateBackBufferViews();
+    bb_fmt_ = fmt;
+    hdr_ = want;
+    LOGI("d3d12: %s output (display peak %.0f nits)", want ? "HDR10" : "SDR", hdr_max_nits_);
+}
+
+// the window's picture as BGRA: the back buffer, or sdr_ under HDR10 (what a screenshot shows on an SDR screen)
+bool D3D12Backend::ReadShown(uint32_t bi, std::vector<uint8_t>& px) {
+    bool ok;
+    if (hdr_drawn_) {
+        Transition(sdr_.Get(), sdr_state_, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        ok = ReadBack(sdr_.Get(), bb_w_, bb_h_, px);
+    } else {
+        D3D12_RESOURCE_STATES st = D3D12_RESOURCE_STATE_PRESENT;
+        Transition(bb_[bi].Get(), st, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        ok = ReadBack(bb_[bi].Get(), bb_w_, bb_h_, px);
+        Transition(bb_[bi].Get(), st, D3D12_RESOURCE_STATE_PRESENT);
+    }
+    if (ok) {
+        for (size_t i = 3; i < px.size(); i += 4) px[i] = 0xFF;
+    }
+    return ok;
 }
 
 void D3D12Backend::ReleaseOldTextures() {
@@ -3964,6 +4095,7 @@ void D3D12Backend::Present(const Surface& front) {
         StartCapture();
     }
     ResizeSwap();
+    UpdateHdr();
     Target* t = EnsureTarget(front, false);
     if (t && LatchCpuWrite(*t)) UploadTarget(*t, front);
     if (t) Resolve(*t);
@@ -4256,13 +4388,8 @@ void D3D12Backend::CapSave(const CapImage& img, const char* name) {
 // F12: the window's picture, the frame and the UI as shown, to screenshots\<game>_<date>_<time>.png in the data
 // folder
 void D3D12Backend::Screenshot(uint32_t bi) {
-    D3D12_RESOURCE_STATES st = D3D12_RESOURCE_STATE_PRESENT;
-    Transition(bb_[bi].Get(), st, D3D12_RESOURCE_STATE_COPY_SOURCE);
     std::vector<uint8_t> px;
-    bool ok = ReadBack(bb_[bi].Get(), bb_w_, bb_h_, px);
-    Transition(bb_[bi].Get(), st, D3D12_RESOURCE_STATE_PRESENT);
-    if (!ok) return;
-    for (size_t i = 3; i < px.size(); i += 4) px[i] = 0xFF;
+    if (!ReadShown(bi, px)) return;
     std::error_code ec;
     std::filesystem::path dir = app::DataDir() / "screenshots";
     std::filesystem::create_directories(dir, ec);
@@ -4283,13 +4410,8 @@ void D3D12Backend::Screenshot(uint32_t bi) {
 
 // the swap chain's buffer as the window shows it, after the frame and the UI: shown.bmp beside final.bmp
 void D3D12Backend::CapShown(uint32_t bi) {
-    D3D12_RESOURCE_STATES st = D3D12_RESOURCE_STATE_PRESENT;
-    Transition(bb_[bi].Get(), st, D3D12_RESOURCE_STATE_COPY_SOURCE);
     std::vector<uint8_t> px;
-    bool ok = ReadBack(bb_[bi].Get(), bb_w_, bb_h_, px);
-    Transition(bb_[bi].Get(), st, D3D12_RESOURCE_STATE_PRESENT);
-    if (!ok) return;
-    for (size_t i = 3; i < px.size(); i += 4) px[i] = 0xFF;
+    if (!ReadShown(bi, px)) return;
     WriteBmp(shown_dir_ / "shown.bmp", bb_w_, bb_h_, px);
 }
 
