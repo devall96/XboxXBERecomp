@@ -756,6 +756,62 @@ bool BuildWithWindow(std::vector<Target>& targets) {
 
 }  // namespace
 
+namespace {
+std::atomic<bool> g_headless_running{false}, g_headless_done{false}, g_headless_ok{false};
+}  // namespace
+
+bool StartGameCodeBuild() {
+    if (g_headless_running) return true;
+    GameFiles game;
+    if (!FindGame(game)) return false;
+    static std::vector<Image> images;
+    images = Images();
+    static std::vector<Target> stale;
+    stale = StaleTargets(game, images);
+    if (stale.empty()) {
+        g_headless_done = g_headless_ok = true;
+        return false;
+    }
+    if (!Blocker(stale).empty()) {
+        g_failure = Blocker(stale);
+        g_headless_done = true;
+        g_headless_ok = false;
+        return false;
+    }
+    for (const Target& target : stale) LOGR("Game code: building %ls.dll (setup)", target.image->exe.c_str());
+    g_headless_running = true;
+    g_headless_done = g_headless_ok = false;
+    g_progress.cancel = false;
+    std::thread([] {
+        HANDLE lock = CreateMutexW(nullptr, FALSE, (std::wstring(kGame.name) + L"-GameCode").c_str());
+        WaitForSingleObject(lock, INFINITE);
+        SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);
+        bool ok = Build(stale);
+        if (ok) g_progress.stage = Stage::Ready;
+        SetThreadExecutionState(ES_CONTINUOUS);
+        ReleaseMutex(lock);
+        CloseHandle(lock);
+        g_headless_ok = ok;
+        g_headless_done = true;
+        g_headless_running = false;
+    }).detach();
+    return true;
+}
+
+BuildStatus GameCodeBuildStatus() {
+    BuildStatus st;
+    st.running = g_headless_running;
+    st.done = g_headless_done;
+    st.ok = g_headless_ok;
+    st.stage = st.done && st.ok ? std::wstring(L"The game's code is built.") : StageText();
+    st.time_left = TimeLeftText();
+    st.fraction = st.done && st.ok ? 1.0f : Fraction();
+    if (st.done && !st.ok) st.failure = g_failure.empty() ? std::wstring(L"Stopped.") : g_failure;
+    return st;
+}
+
+void CancelGameCodeBuild() { g_progress.cancel = true; }
+
 bool PrepareGameCode(const GameFiles& game) {
     // one build at a time: a second copy of the game started meanwhile waits for it, then finds the DLL current
     std::wstring mutex_name = std::wstring(kGame.name) + L"-GameCode";

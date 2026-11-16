@@ -107,6 +107,18 @@ std::string Sha1(const std::vector<uint8_t>& data);  // lower case hex
 // the recompiled code, <exe>.dll, built from the game in assets when missing or out of date (game_code.cpp) and
 // loaded; false after telling the player why the game cannot start, or when they chose not to start it yet
 bool PrepareGameCode(const GameFiles& game);
+// the same build without its window, for a launcher's setup screen (as Savage Wind's setup builds while it shows its
+// own progress): false when the game is not found or its code is current. The status is read while it runs.
+bool StartGameCodeBuild();
+struct BuildStatus {
+    bool running = false, done = false, ok = false;
+    std::wstring stage;      // what it is doing, as the build window says it
+    std::wstring time_left;  // while compiling
+    float fraction = 0;      // 0..1
+    std::wstring failure;    // when it failed
+};
+BuildStatus GameCodeBuildStatus();
+void CancelGameCodeBuild();
 int Instance();  // --instance N on the command line, 0 without: a second copy on this PC for system link tests
 void* Window();  // HWND
 // boot splash: GameInfo::splash .bmp or .png beside the exe, up before the game window
