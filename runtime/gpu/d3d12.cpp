@@ -656,12 +656,14 @@ private:
     float draw_y_[2] = {1, 0};
     float draw_x_[2] = {1, 0};  // MeasureDrawX: this draw's v0.x range
     void ChooseDrawSide(bool writes_depth);
-    float draw_side_ = 0;
+    float draw_side_ = 0, draw_vside_ = 0;
+    bool HudPlacing() const;
     bool draw_sided_ = false;
     struct SidedPiece {
-        float lo, hi, top, bottom, side;
+        float lo, hi, top, bottom, side, vside;
     };
-    std::vector<SidedPiece> sided_;  // this frame's pieces placed against an edge
+    std::vector<SidedPiece> sided_;       // this frame's pieces placed against an edge
+    std::vector<SidedPiece> prev_sided_;  // last frame's
     // the present through FSR 1 and grading (post/present.hlsl): the view to mid_ at the output's size, then mid_ to
     // the swap chain with RCAS, the gamma ramp and the grade; false leaves it to the plain blit
     bool PresentPost(Target& t, const float uv[4], const D3D12_VIEWPORT& vp);
@@ -1793,12 +1795,25 @@ void D3D12Backend::FillWideConstants(DrawConstants& c) const {
     c.wide[0] = c.wide[1] = 0;
     c.wide[2] = 1;
     c.wide[3] = 0;
-    if (wide_ == 1.0f || !bound_rt_ || bound_rt_->gw != guest_w_ || bound_rt_->gh != guest_h_) return;
+    c.hud[0] = c.hud[1] = c.hud[2] = c.hud[3] = 0;
+    if (!HudPlacing() || !bound_rt_ || bound_rt_->gw != guest_w_ || bound_rt_->gh != guest_h_) return;
     c.wide[0] = 1.0f / wide_;
     c.wide[1] = 1;
     c.wide[2] = draw_side_;
     c.wide[3] = draw_sided_ ? 1.0f : 0.0f;
+    // the console's TV safe margin as Whiplash's HUD keeps it, in console pixels: the share hud_edge takes away
+    constexpr float kMarginX = 32, kMarginY = 18;
+    float edge = app::Get().hud_edge / 100.0f;
+    if (edge > 0 && draw_sided_) {
+        c.hud[0] = draw_vside_;
+        c.hud[1] = 2 * kMarginX * edge / guest_w_ / wide_;  // console pixels stay square in a widened frame
+        c.hud[2] = 2 * kMarginY * edge / guest_h_;
+        c.hud[3] = 1;
+    }
 }
+
+// HUD pieces are placed when the frame is widened or hud_edge moves them out
+bool D3D12Backend::HudPlacing() const { return wide_ != 1.0f || app::Get().hud_edge > 0; }
 
 // A HUD piece's side from its place on the console's screen: starting within 20% of the width from the left edge
 // and staying in the left 60% is a left piece, its mirror a right one, the full width stays as drawn (2), the rest
@@ -1807,9 +1822,11 @@ void D3D12Backend::FillWideConstants(DrawConstants& c) const {
 void D3D12Backend::ChooseDrawSide(bool writes_depth) {
     draw_sided_ = false;
     draw_side_ = 0;
+    draw_vside_ = 0;
     float lo = draw_x_[0], hi = draw_x_[1], top = draw_y_[0], bottom = draw_y_[1];
     if (lo > hi) return;
-    float w = float(guest_w_), h = float(guest_h_);
+    // the console's screen: its width, and the height its picture uses (the game's view, else the buffer)
+    float w = float(guest_w_), h = float(app::kGame.view_h ? app::kGame.view_h : guest_h_);
     // 2D programs take 0..1 across the screen (Whiplash: x * c95.z), pretransformed vertices pixels
     constexpr float kUnitSlack = 0.05f;
     if (lo >= -kUnitSlack && hi <= 1 + kUnitSlack) {
@@ -1830,29 +1847,39 @@ void D3D12Backend::ChooseDrawSide(bool writes_depth) {
     constexpr float kNearEdge = 0.2f, kHalfPlus = 0.6f, kSlack = 2.0f;
     if (lo < w * kNearEdge && hi < w * kHalfPlus) draw_side_ = -1;
     else if (hi > w * (1 - kNearEdge) && lo > w * (1 - kHalfPlus)) draw_side_ = 1;
-    else {
-        for (const SidedPiece& p : sided_)
+    if (top < h * kNearEdge && bottom < h * kHalfPlus) draw_vside_ = -1;
+    else if (bottom > h * (1 - kNearEdge) && top > h * (1 - kHalfPlus)) draw_vside_ = 1;
+    // inside a box placed earlier this frame: its text and bars go where the box went
+    // this frame's boxes, then last frame's: text drawn before its box finds the box where it was a frame ago
+    bool inside = false;
+    for (const auto* list : {&sided_, &prev_sided_}) {
+        for (const SidedPiece& p : *list)
             if (lo >= p.lo - kSlack && hi <= p.hi + kSlack && top >= p.top - kSlack && bottom <= p.bottom + kSlack) {
                 draw_side_ = p.side;
+                draw_vside_ = p.vside;
+                inside = true;
                 break;
             }
+        if (inside) break;
     }
     constexpr size_t kMaxPieces = 256;
-    // a carrier is HUD sized: at most 40% of the width and a quarter of the height (a screen frame's side line is not)
-    constexpr float kMaxCarrier = 0.4f, kMaxCarrierH = 0.25f;
+    // a carrier is HUD sized: at most 55% of the width (a health box is half) and a quarter of the height (a screen
+    // frame's side line is not)
+    constexpr float kMaxCarrier = 0.55f, kMaxCarrierH = 0.25f;
     float hh = std::fabs(bottom - top);
-    if (draw_side_ == 0 || writes_depth || hi - lo > w * kMaxCarrier || hh > h * kMaxCarrierH) return;
+    if ((draw_side_ == 0 && draw_vside_ == 0) || writes_depth || hi - lo > w * kMaxCarrier || hh > h * kMaxCarrierH)
+        return;
     // a box drawn as border pieces: touching pieces on one side grow into the box they outline
     constexpr float kTouch = 4.0f;
-    SidedPiece piece{lo, hi, top, bottom, draw_side_};
+    SidedPiece piece{lo, hi, top, bottom, draw_side_, draw_vside_};
     for (auto it = sided_.begin(); it != sided_.end();) {
-        bool touches = it->side == piece.side && it->lo <= piece.hi + kTouch && piece.lo <= it->hi + kTouch &&
+        bool touches = it->side == piece.side && it->vside == piece.vside && it->lo <= piece.hi + kTouch && piece.lo <= it->hi + kTouch &&
                        it->top <= piece.bottom + kTouch && piece.top <= it->bottom + kTouch;
         float merged = std::max(it->hi, piece.hi) - std::min(it->lo, piece.lo);
         float merged_h = std::max(it->bottom, piece.bottom) - std::min(it->top, piece.top);
         if (touches && merged <= w * kMaxCarrier && merged_h <= h * kMaxCarrierH) {
             piece = {std::min(it->lo, piece.lo), std::max(it->hi, piece.hi), std::min(it->top, piece.top),
-                     std::max(it->bottom, piece.bottom), piece.side};
+                     std::max(it->bottom, piece.bottom), piece.side, piece.vside};
             it = sided_.erase(it);
         } else {
             ++it;
@@ -1869,7 +1896,7 @@ void D3D12Backend::MeasureDrawX(const Assembled& a, bool writes_depth) {
     draw_sided_ = false;
     draw_side_ = 0;
     constexpr uint32_t kMaxMeasured = 4096;  // 2D pieces are small; 3D never takes the 2D path
-    if (wide_ == 1.0f || !(a.regs & 1) || a.vertex_count > kMaxMeasured) return;
+    if (!HudPlacing() || !(a.regs & 1) || a.vertex_count > kMaxMeasured) return;
     const VertexElement& e = a.elements[0];
     float lo = 1e30f, hi = -1e30f, top = 1e30f, bottom = -1e30f;
     auto take = [&](float x, float y) {
@@ -3832,6 +3859,7 @@ void D3D12Backend::Present(const Surface& front) {
 
     presents_++;
     presents_seen_.store(presents_);
+    prev_sided_.swap(sided_);
     sided_.clear();
     WriteFrameTime();
     frame_++;

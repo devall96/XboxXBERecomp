@@ -56,6 +56,7 @@ const char* kCommonTail = R"(    float4 spread[4];
     float4 rtshift;
     float4 zparams;
     float4 wide;
+    float4 hud;
 };
 )";
 
@@ -241,6 +242,11 @@ const char* kVsEpilogue = R"(
         } else if (p.x > 1 && p.x < surf.x - 1) {
             q.x *= wide.x;
         }
+    }
+    // hud_edge: the piece past the console's TV safe margin, out to its edges
+    if (hud.w != 0 && p.w == 1 && wide.w == 1 && wide.z != 2) {
+        q.x += wide.z * hud.y;
+        q.y -= hud.x * hud.z;
     }
     q.z = p.z * surf.z;
     q.xyz *= p.w;

@@ -106,7 +106,9 @@ struct DrawConstants {
     float rtshift[4];    // per kTexTarget stage: host pixels its reads move along x and y, negative up and left
     float zparams[4];    // ReversedDepthHlsl: a w buffer's scale (0 for a z buffer), its far w, the polygon offset
     float wide[4];       // app::Wide::Expand on the frame: x the 2D narrowing (1 / WideFactor), y 1, else all 0;
-                         // zw the draw's v0.x range (z > w: unknown)
+                         // z the HUD piece's side (-1 left, 1 right, 0 centred, 2 full width), w 1 with one
+    float hud[4];        // the HUD piece moved to the edges: x its vertical side (-1 top, 1 bottom), yz the move
+                         // in clip units along x and y, w 1 to move
 };
 
 }  // namespace gpu

@@ -43,6 +43,9 @@ struct Settings {
     uint32_t texture_dump_format = 0;  // 0 PNG, 1 DDS
     uint32_t audio_output = 0;         // audio::kOutputAuto, Stereo, Surround or Mono
     Wide widescreen = Wide::Console;   // Expand where the game has it (Load picks it for a new settings file)
+    // HUD pieces moved out to the screen's edges, percent of the console's TV safe margin taken away: 0 where the
+    // console put them, 100 at the edges with a thin margin as modern HUDs
+    uint32_t hud_edge = 100;
     uint32_t upscaler = 1;             // 0 bilinear, 1 AMD FSR 1 (EASU) when the view renders smaller than it shows
     uint32_t sharpen = 0;              // 0 off, to 100: FSR 1's RCAS, 2 stops (100 the sharpest)
     // colour grading of the presented picture: exposure in hundredths of a stop, contrast and saturation in percent,

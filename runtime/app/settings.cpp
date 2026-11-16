@@ -71,6 +71,7 @@ void Load() {
         if (wide == kWide[i]) s.widescreen = Wide(i);
     if (s.widescreen == Wide::Expand && !kGame.expands) s.widescreen = Wide::Console;
     s.upscaler = std::min(t["upscaler"].value_or(s.upscaler), 1u);
+    s.hud_edge = std::min(t["hud_edge"].value_or(s.hud_edge), 100u);
     s.sharpen = std::min(t["sharpen"].value_or(s.sharpen), 100u);
     s.grade_exposure = std::clamp(t["grade_exposure"].value_or(s.grade_exposure), -300, 300);
     s.grade_contrast = std::clamp(t["grade_contrast"].value_or(s.grade_contrast), 50u, 200u);
@@ -106,6 +107,7 @@ toml::table Table() {
                   {"audio_output", int64_t(s.audio_output)},
                   {"widescreen", kWide[uint32_t(s.widescreen)]},
                   {"upscaler", int64_t(s.upscaler)},
+                  {"hud_edge", int64_t(s.hud_edge)},
                   {"sharpen", int64_t(s.sharpen)},
                   {"grade_exposure", int64_t(s.grade_exposure)},
                   {"grade_contrast", int64_t(s.grade_contrast)},
