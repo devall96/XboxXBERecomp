@@ -1475,8 +1475,233 @@ HLE_STDCALL(D3DDevice_BeginPush, 1) {
     return g_push_begin;
 }
 
+// Raw hardware state a title writes into its own push buffers (Whiplash renders everything this way): vertex program
+// uploads, vertex array formats, texture stages and the pixel combiners become the renderer's state for the inline
+// array draws among them. Shaders and texture headers are made once per distinct content, as the render thread tells
+// shaders apart by pointer and textures by header.
+namespace {
+struct PushedState {
+    std::array<uint32_t, 136 * 4> program{};  // the vertex program slots, 4 dwords each
+    uint32_t load = 0;                        // dword cursor of the program data method
+    uint32_t start = 0;                       // first slot the program runs
+    bool programmable = false;                // transform execution mode: program, not the fixed pipeline
+    bool formats_set = false;
+    std::array<uint32_t, 16> formats{};       // vertex data array format per slot
+    std::array<uint32_t, 4> tex_offset{}, tex_format{}, tex_control{};
+    std::array<uint32_t, 16> offsets{};       // vertex data array offset per slot (physical)
+};
+PushedState g_pushed;
+// bring-up counters, logged once a second: buffer runs, inline draws drawn and dropped, vertex array draws skipped
+struct PushedStats {
+    uint32_t runs = 0, drawn = 0, dropped = 0, no_layout = 0, arrays = 0;
+    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+} g_pushed_stats;
+void LogPushedStats() {
+    auto& st = g_pushed_stats;
+    auto now = std::chrono::steady_clock::now();
+    if (now - st.last < std::chrono::seconds(1)) return;
+    LOGI("d3d: pushed per second: %u runs, %u inline draws, %u dropped, %u without a layout, %u vertex array methods",
+         st.runs, st.drawn, st.dropped, st.no_layout, st.arrays);
+    st = {};
+    st.last = now;
+}
+constexpr uint32_t kMExecutionMode = 0x1E94, kMProgramLoad = 0x1E9C, kMProgramStart = 0x1EA0;
+constexpr uint32_t kMProgramData = 0x0B00, kMProgramDataEnd = 0x0B80, kMArrayFormat = 0x1760, kMArrayFormatEnd = 0x17A0;
+constexpr uint32_t kMTexture = 0x1B00, kTexStage = 0x40, kTexOffset = 0, kTexFormat = 4, kTexControl0 = 0xC;
+constexpr uint32_t kMShaderStageProgram = 0x1E70;  // the pixel shader's texture modes
+constexpr uint32_t kTexEnable = 0x40000000;
+
+// a texture header in system memory per pushed offset and format
+uint32_t PushedTextureHeader(uint32_t offset, uint32_t format) {
+    static std::map<std::pair<uint32_t, uint32_t>, uint32_t> headers;
+    uint32_t& h = headers[{offset, format}];
+    if (!h) {
+        h = mem::AllocSystem(20);
+        W32(h, 0x00040001);  // a texture, one reference
+        W32(h + 4, offset);
+        W32(h + 12, format);
+    }
+    return h;
+}
+
+// true for the methods kept here; texture and mode methods also go on to the simple states
+bool ApplyPushedState(uint32_t m, uint32_t v) {
+    auto& ps = g_pushed;
+    if (m == kMProgramLoad) {
+        ps.load = v * 4;
+        return true;
+    }
+    if (m >= kMProgramData && m < kMProgramDataEnd) {
+        if (ps.load < ps.program.size()) ps.program[ps.load++] = v;
+        return true;
+    }
+    if (m == kMProgramStart) {
+        ps.start = v;
+        return true;
+    }
+    if (m >= kMArrayFormat && m < kMArrayFormatEnd) {
+        ps.formats[(m - kMArrayFormat) / 4] = v;
+        ps.formats_set = true;
+        return true;
+    }
+    if (m == kMExecutionMode) ps.programmable = (v & 3) == 2;
+    if (m >= kMTexture && m < kMTexture + 4 * kTexStage) {
+        uint32_t s = (m - kMTexture) / kTexStage, r = (m - kMTexture) % kTexStage;
+        if (r == kTexOffset) ps.tex_offset[s] = v;
+        if (r == kTexFormat) ps.tex_format[s] = v;
+        if (r == kTexControl0) ps.tex_control[s] = v;
+    }
+    return false;
+}
+
+uint32_t VertexTypeBytes(uint32_t type, uint32_t size) {
+    switch (type) {
+        case 0: case 4: return size;      // unsigned bytes
+        case 1: case 5: return size * 2;  // shorts
+        case 6: return 4;                 // packed normal
+        default: return size * 4;         // floats
+    }
+}
+
+// the program and input layout the pushed state describes, null when the formats were never pushed
+std::shared_ptr<gpu::VertexShader> PushedVertexShader(uint32_t& stride) {
+    auto& ps = g_pushed;
+    if (!ps.formats_set) return nullptr;
+    std::vector<uint32_t> key(ps.formats.begin(), ps.formats.end());
+    key.push_back(ps.programmable);
+    if (ps.programmable)
+        for (uint32_t slot = ps.start; slot < 136; slot++) {
+            key.insert(key.end(), &ps.program[slot * 4], &ps.program[slot * 4] + 4);
+            if (ps.program[slot * 4 + 3] & 1) break;  // the program's last instruction
+        }
+    static std::map<std::vector<uint32_t>, std::shared_ptr<gpu::VertexShader>> made;
+    auto& vs = made[key];
+    if (!vs) {
+        vs = std::make_shared<gpu::VertexShader>();
+        vs->handle = 0xFFFF0001u - uint32_t(made.size()) * 2;
+        vs->program_type = 0x2078;
+        if (ps.programmable) vs->program.assign(key.begin() + 17, key.end());
+        uint32_t off = 0;
+        for (uint32_t s = 0; s < 16; s++) {
+            uint32_t f = ps.formats[s], type = f & 0xF, size = (f >> 4) & 0xF;
+            if (!size) continue;
+            vs->inputs[s] = {0, off, (size << 4) | type};
+            off += VertexTypeBytes(type, size);
+        }
+        vs->stream_stride[0] = off;
+    }
+    stride = vs->stream_stride[0];
+    return vs;
+}
+
+// the pixel combiners the pushed registers describe, as a D3DPIXELSHADERDEF (SetPixelShader's mapping, reversed)
+std::shared_ptr<gpu::PixelShader> PushedPixelShader() {
+    auto S = [](uint32_t m) { return g_state.simple[m >> 2]; };
+    std::array<uint32_t, 0xF0 / 4> d{};
+    for (uint32_t i = 0; i < 8; i++) {
+        d[0 + i] = S(gpu::kMPsAlphaInputs + i * 4);
+        d[10 + i] = S(gpu::kMPsConstant0 + i * 4);
+        d[18 + i] = S(gpu::kMPsConstant1 + i * 4);
+        d[26 + i] = S(gpu::kMPsAlphaOutputs + i * 4);
+        d[34 + i] = S(gpu::kMPsRgbInputs + i * 4);
+        d[45 + i] = S(gpu::kMPsRgbOutputs + i * 4);
+    }
+    d[8] = S(gpu::kMPsFinalAbcd);
+    d[9] = S(gpu::kMPsFinalEfgh);
+    d[42] = S(gpu::kMPsCompareMode);
+    d[43] = S(gpu::kMPsFinalConstant0);
+    d[44] = S(gpu::kMPsFinalConstant1);
+    d[53] = S(gpu::kMPsCombinerCount);
+    d[54] = S(kMShaderStageProgram);
+    d[55] = S(gpu::kMPsDotMapping);
+    d[56] = S(gpu::kMPsInputTexture);
+    if (!(d[53] & 0xFF)) return nullptr;  // no combiner stages pushed
+    static std::map<std::array<uint32_t, 0xF0 / 4>, std::shared_ptr<gpu::PixelShader>> made;
+    auto& p = made[d];
+    if (!p) {
+        p = std::make_shared<gpu::PixelShader>();
+        p->handle = 0xFFFE0000u + uint32_t(made.size());
+        std::memcpy(p->def, d.data(), sizeof(p->def));
+    }
+    return p;
+}
+
+bool DrawPushed(uint32_t prim, const std::vector<uint32_t>& vertices);
+
+// a primitive drawn from the vertex arrays by index: each vertex is gathered from the slots' arrays into the packed
+// layout PushedVertexShader describes, then drawn as an inline array
+bool DrawPushedArrays(uint32_t prim, const std::vector<uint32_t>& indices) {
+    uint32_t stride = 0;
+    auto vs = PushedVertexShader(stride);
+    if (!vs || !stride || indices.empty()) {
+        g_pushed_stats.no_layout++;
+        return false;
+    }
+    struct Slot {
+        const uint8_t* base;
+        uint32_t stride, bytes, offset;
+    };
+    Slot slots[16];
+    uint32_t n = 0;
+    for (uint32_t s = 0; s < 16; s++) {
+        const auto& in = vs->inputs[s];
+        if (in.stream < 0) continue;
+        uint32_t f = g_pushed.formats[s];
+        slots[n++] = {static_cast<const uint8_t*>(HostPtr(mem::VirtualFromPhysical(g_pushed.offsets[s] & 0x0FFFFFFF))),
+                      f >> 8, VertexTypeBytes(f & 0xF, (f >> 4) & 0xF), in.offset};
+    }
+    static std::vector<uint32_t> packed;
+    packed.assign((size_t(indices.size()) * stride + 3) / 4, 0);
+    auto* out = reinterpret_cast<uint8_t*>(packed.data());
+    for (size_t v = 0; v < indices.size(); v++)
+        for (uint32_t k = 0; k < n; k++)
+            std::memcpy(out + v * stride + slots[k].offset, slots[k].base + size_t(indices[v]) * slots[k].stride,
+                        slots[k].bytes);
+    return DrawPushed(prim, packed);
+}
+
+// an inline array primitive drawn with the pushed program, layout, textures and combiners; false when nothing was
+// pushed to draw it with
+bool DrawPushed(uint32_t prim, const std::vector<uint32_t>& vertices) {
+    uint32_t stride = 0;
+    auto vs = PushedVertexShader(stride);
+    if (!vs || !stride || vertices.empty()) {
+        g_pushed_stats.no_layout++;
+        return false;
+    }
+    uint32_t bytes = uint32_t(vertices.size()) * 4;
+    if (bytes % stride) {
+        g_pushed_stats.dropped++;
+        LOG_FIRST(8, "d3d: pushed primitive %u dropped, %u bytes of vertices of %u", prim, bytes, stride);
+        return true;
+    }
+    g_pushed_stats.drawn++;
+    LOG_FIRST(4, "d3d: pushed draw prim %u, %u vertices of %u bytes, program %u, tex0 %08X/%08X, combiners %u", prim,
+              bytes / stride, stride, uint32_t(vs->program.size() / 4), g_pushed.tex_offset[0], g_pushed.tex_format[0],
+              g_state.simple[gpu::kMPsCombinerCount >> 2] & 0xFF);
+    auto saved_vs = g_state.vs;
+    auto saved_ps = g_state.ps;
+    uint32_t saved_handle = g_state.vs_handle;
+    auto saved_textures = g_state.textures;
+    g_state.vs = vs;
+    g_state.vs_handle = g_pushed.programmable ? vs->handle : (vs->handle & ~1u);
+    if (auto ps = PushedPixelShader()) g_state.ps = ps;
+    for (uint32_t s = 0; s < 4; s++)
+        g_state.textures[s] = g_pushed.tex_control[s] & kTexEnable && g_pushed.tex_format[s]
+                                  ? PushedTextureHeader(g_pushed.tex_offset[s], g_pushed.tex_format[s])
+                                  : 0;
+    DrawUp(prim, bytes / stride, vertices.data(), stride);
+    g_state.vs = saved_vs;
+    g_state.ps = saved_ps;
+    g_state.vs_handle = saved_handle;
+    g_state.textures = saved_textures;
+    return true;
+}
+}  // namespace
+
 // a primitive whose vertices came as an inline array, in the bound vertex format
 static void DrawInline(uint32_t prim, const std::vector<uint32_t>& vertices) {
+    if (DrawPushed(prim, vertices)) return;
     if (vertices.empty()) return;
     uint32_t stride = VertexBytes();
     uint32_t bytes = uint32_t(vertices.size()) * 4;
@@ -1488,17 +1713,30 @@ static void RunCommands(uint32_t begin, uint32_t end) {
     constexpr uint32_t kBeginEnd = 0x17FC, kInlineArray = 0x1818;
     // vertex array offsets and formats, then index elements and draw arrays up to the inline array
     constexpr uint32_t kArrayOffsets = 0x1720, kArrayFormatsEnd = 0x17A0, kArrayDraws = 0x1800;
-    static std::vector<uint32_t> vertices;
+    constexpr uint32_t kArrayElement16 = 0x1800, kArrayElement32 = 0x1808, kDrawArrays = 0x1810;
+    static std::vector<uint32_t> vertices, indices;
     uint32_t prim = 0;
     // jumps and calls are followed (Whiplash's per frame buffer jumps into a 4 MB scene buffer, which jumps back): the
     // walk ends where the buffer ends, a return with nothing to return to, or after a budget that stops a jump loop
     constexpr uint32_t kReturn = 0x00020000;
     uint32_t returns[4], depth = 0, budget = 1u << 22;
     auto in_buffer = [&](uint32_t q) { return q >= begin && q < end; };
+    // UNCHAINED_PB_DUMP set: the first two runs' commands go to pbdump.txt (bring-up of the push buffer interpreter)
+    static int dumps = std::getenv("UNCHAINED_PB_DUMP") ? 2 : 0;
+    static FILE* dump = nullptr;
+    if (dumps && !dump) dump = std::fopen("pbdump.txt", "w");
+    FILE* df = dumps > 0 && begin < end ? dump : nullptr;
+    if (df) std::fprintf(df, "run %08X..%08X\n", begin, end);
     for (uint32_t p = begin; begin && p != end && budget; budget--) {
         if (in_buffer(p) && p + 4 > end) break;
         // count in bits 18 to 28, bit 30 keeps the method for every value
         uint32_t head = R32(p), method = head & 0x1FFC, n = (head >> 18) & 0x7FF;
+        if (df) {
+            std::fprintf(df, "%08X %08X m %04X n %u%s", p, head, method, n, head & 0x40000000 ? " ni" : "");
+            for (uint32_t i = 0; i < std::min<uint32_t>(n, 8) && !(head & 0xA0030003); i++)
+                std::fprintf(df, " %08X", R32(p + 4 + i * 4));
+            std::fprintf(df, "\n");
+        }
         p += 4;
         if ((head & 3) == 1 || (head & 0xE0000003) == 0x20000000) {  // jump: old style (bit 0), new style (bit 29)
             p = mem::VirtualFromPhysical((head & 3) == 1 ? head & ~3u : head & 0x1FFFFFFC);
@@ -1524,16 +1762,40 @@ static void RunCommands(uint32_t begin, uint32_t end) {
             if (m == kInlineArray) {
                 if (prim) vertices.push_back(v);
             } else if (m == kBeginEnd) {
-                if (!v && prim) DrawInline(prim, vertices);
+                if (!v && prim) {
+                    if (!indices.empty()) DrawPushedArrays(prim, indices);
+                    else if (!vertices.empty()) DrawInline(prim, vertices);
+                }
                 prim = v;
                 vertices.clear();
+                indices.clear();
                 ApplyImmediate(m, v);
+            } else if (ApplyPushedState(m, v)) {
+                // program, array formats: kept for the inline array draws (DrawPushed)
+            } else if (m >= kArrayOffsets && m < kArrayOffsets + 0x40) {
+                g_pushed.offsets[(m - kArrayOffsets) / 4] = v;
+            } else if (m == kArrayElement16) {
+                if (prim) {
+                    indices.push_back(v & 0xFFFF);
+                    indices.push_back(v >> 16);
+                }
+            } else if (m == kArrayElement32) {
+                if (prim) indices.push_back(v);
+            } else if (m == kDrawArrays) {
+                if (prim)
+                    for (uint32_t k = 0, first = v & 0xFFFFFF, count = (v >> 24) + 1; k < count; k++)
+                        indices.push_back(first + k);
             } else if ((m >= kArrayOffsets && m < kArrayFormatsEnd) || (m >= kArrayDraws && m < kInlineArray)) {
+                g_pushed_stats.arrays++;
                 LOG_FIRST(16, "d3d: pushed commands draw from vertex arrays (method %04X), which is not run", m);
             } else if (!ApplyConstant(m, v) && !ApplyImmediate(m, v) && m >> 2 < g_state.simple.size()) {
                 SetSimple(m, v);
             }
         }
+    }
+    if (df && --dumps == 0) {
+        std::fclose(dump);
+        dump = nullptr;
     }
 }
 
@@ -1553,7 +1815,9 @@ HLE_STDCALL(D3DDevice_RunPushBuffer, 2) {
     LOG_FIRST(8, "d3d: RunPushBuffer %08X, %u bytes, first command %08X", data, size, size ? R32(data) : 0);
     if (a[1]) LOG_FIRST(1, "d3d: RunPushBuffer fixups are not applied");
     Walk(Dev(kDevPush));
+    g_pushed_stats.runs++;
     if (size >= 4) RunCommands(data, data + size - 4);
+    LogPushedStats();
     return 0;
 }
 
