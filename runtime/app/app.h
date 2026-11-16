@@ -164,6 +164,9 @@ struct GameInfo {
     bool (*disc_file)(const std::string& path, std::filesystem::path& host) = nullptr;
     // a draw sampling this texture (its virtual address) is left out: an effect the player turned off
     bool (*skip_texture)(uint32_t data) = nullptr;
+    // the game's own launcher or Configuration app, before the game is looked for (not on a relaunch): false ends the
+    // run (the player closed it), true starts the game; it reads the command line itself
+    bool (*launcher)() = nullptr;
     const wchar_t* release_name = nullptr;
 };
 extern const GameInfo kGame;

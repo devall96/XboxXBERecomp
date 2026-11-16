@@ -256,6 +256,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     if (relaunched && !logx::kVerbose) LOGR("Relaunched: %s", IMAGE_XBE);
     else app::LogSystem();
 
+    // the launcher, then the game; a relaunch into the built code goes straight on
+    if (app::kGame.launcher && !relaunched && !app::kGame.launcher()) return 0;
+
     app::GameFiles game;
     if (!app::FindGame(game)) return 1;
     if (!app::PrepareGameCode(game)) return 1;
