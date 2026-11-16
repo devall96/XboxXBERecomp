@@ -51,6 +51,8 @@ struct Settings {
     uint32_t grade_contrast = 100, grade_saturation = 100;
     int32_t grade_temperature = 0, grade_tint = 0;
     std::string join_ip;                   // co-op: a host past the LAN the system link search also asks
+    std::string save_folder;               // the console's hard disk (saves), empty for hdd beside the exe
+    uint32_t save_backups = 5;             // copies of the saves made at each start and kept, 0 for none
 };
 
 Settings& Get();
@@ -79,6 +81,10 @@ float FrameAspect();
 float WideFactor();
 
 std::filesystem::path ExeDir();
+// the console's hard disk: save_folder, else hdd (hddN for --instance N) beside the exe (saves.cpp)
+std::filesystem::path HardDisk();
+// at start, before boot: the saves copied to "save backups\<date time>" beside the disk, save_backups kept
+void BackupSaves();
 // the game in assets (game_files.cpp): its folder and this executable's xbe, from the extracted files or a disc
 // image (.iso), which it mounts as D:; false after telling the player what is missing
 struct GameFiles {

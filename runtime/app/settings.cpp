@@ -63,6 +63,8 @@ void Load() {
     s.dump_textures = t["dump_textures"].value_or(s.dump_textures);
     s.texture_dump_format = std::min(t["texture_dump_format"].value_or(s.texture_dump_format), 1u);
     s.join_ip = t["join_ip"].value_or(s.join_ip);
+    s.save_folder = t["save_folder"].value_or(s.save_folder);
+    s.save_backups = t["save_backups"].value_or(s.save_backups);
     s.audio_output = std::min(t["audio_output"].value_or(s.audio_output), audio::kOutputMono);
     std::string wide = t["widescreen"].value_or(std::string(kWide[uint32_t(s.widescreen)]));
     for (uint32_t i = 0; i < 3; i++)
@@ -99,6 +101,8 @@ toml::table Table() {
                   {"dump_textures", s.dump_textures},
                   {"texture_dump_format", int64_t(s.texture_dump_format)},
                   {"join_ip", s.join_ip},
+                  {"save_folder", s.save_folder},
+                  {"save_backups", int64_t(s.save_backups)},
                   {"audio_output", int64_t(s.audio_output)},
                   {"widescreen", kWide[uint32_t(s.widescreen)]},
                   {"upscaler", int64_t(s.upscaler)},
