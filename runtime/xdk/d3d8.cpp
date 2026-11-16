@@ -141,6 +141,9 @@ void SetSimple(uint32_t method, uint32_t v) {
 std::unordered_map<uint32_t, std::shared_ptr<gpu::VertexShader>> g_vs;
 std::unordered_map<uint32_t, std::shared_ptr<gpu::PixelShader>> g_ps;
 std::array<uint32_t, 3> g_buffers{};  // front, back surfaces
+// the front and back buffers' memory when the device was made: a title that keeps these addresses in its own push
+// buffer means whichever buffer has that role now, as the console's push buffer fixups would patch
+uint32_t g_first_front = 0, g_first_back = 0;
 uint32_t g_buffer_count = 2;
 uint32_t g_depth = 0;
 // the console's frame buffers are the multisample factor times the asked size, and after SetBackBufferScale it draws
@@ -259,9 +262,31 @@ void UpdateViewportConstants() {
     }
 }
 
+// NV2A culling registers: enable, the face culled (0x404 front, 0x405 back), the front face (0x900 cw, 0x901 ccw)
+constexpr uint32_t kMCullEnable = 0x308, kMCullFace = 0x39C, kMFrontFace = 0x3A0;
+
 void SetComplex(uint32_t rs, uint32_t v) {
     g_state.rs[rs] = v;
     W32(kRenderState + rs * 4, v);
+    // the registers the library's CullMode and FrontFace push, which a title's own push buffer may change after: the
+    // culled face is the front one when the mode names the front face's winding, else the back one
+    if (rs == gpu::kRsCullMode || rs == gpu::kRsFrontFace) {
+        uint32_t mode = g_state.rs[gpu::kRsCullMode], front = g_state.rs[gpu::kRsFrontFace];
+        if (rs == gpu::kRsFrontFace) SetSimple(kMFrontFace, front);
+        SetSimple(kMCullEnable, mode != 0);
+        if (mode) SetSimple(kMCullFace, mode == front ? 0x404u : 0x405u);
+    }
+}
+
+// the D3D cull mode the pushed culling registers describe: the winding of the culled triangles
+uint32_t PushedCullMode() {
+    if (!g_state.simple[kMCullEnable >> 2]) return 0;
+    uint32_t front = g_state.simple[kMFrontFace >> 2], face = g_state.simple[kMCullFace >> 2];
+    // a front face other than cw or ccw (Whiplash pushes 0 once a frame) leaves the one the API set
+    if (front != 0x900 && front != 0x901) front = g_state.rs[gpu::kRsFrontFace] ? g_state.rs[gpu::kRsFrontFace] : 0x900;
+    if (face == 0x404) return front;          // the front face culled
+    if (face == 0x405) return front ^ 1;      // the back face culled: the other winding
+    return 0;                                 // front and back (0x408), or never set: drawn
 }
 
 // The library's default render and texture stage states; its pushes land in the scratch buffer
@@ -291,6 +316,8 @@ void SetFrameBuffers(const char* caller, uint32_t pp) {
         made = asked;
         g_buffer_count = asked[3];
         for (uint32_t i = 0; i < g_buffer_count; i++) g_buffers[i] = NewSurface(w, h, color_fmt, 4);
+        g_first_front = R32(g_buffers[0] + 4) & 0x7FFFFFFF;
+        g_first_back = R32(g_buffers[1] + 4) & 0x7FFFFFFF;
         g_depth = zf ? NewSurface(w, h, zf, zf == 0x30 || zf == 0x31 ? 2 : 4) : 0;  // 0x30 LIN_D16, 0x31 LIN_F16
     }
     if (!g_backend) {
@@ -310,7 +337,8 @@ void SetFrameBuffers(const char* caller, uint32_t pp) {
     SetDev(kDevRenderTarget, g_buffers[1]);
     SetDev(kDevDepth, g_depth);
     SetDev(kDevBackBuffer, g_buffers[1]);
-    SetDev(kDevFrontBuffer, g_buffers[1]);
+    // GetBackBuffer2(-1) reads the front one here (a title that runs the library's own reads the field)
+    SetDev(kDevFrontBuffer, g_buffers[0]);
     float one = 1.0f, zs = g_depth && (R32(g_depth + 12) >> 8 & 0xFF) == 0x30 ? 65535.0f : 16777215.0f;
     std::memcpy(HostPtr(kDevice + kDevSuperX), &one, 4);
     std::memcpy(HostPtr(kDevice + kDevSuperY), &one, 4);
@@ -1735,6 +1763,16 @@ bool DrawPushed(uint32_t prim, const std::vector<uint32_t>& vertices) {
     constexpr uint32_t kMDepthTest = 0x30C;
     // the depth test's enable is a D3D render state to the renderer (1 z, 2 w buffer); a pushed draw takes it from the
     // pushed register, keeping a w buffer the title chose through the API
+    // culling from the pushed registers too: Whiplash turns it on and off around its own draws (18 times a frame),
+    // while its last API call (the start up GPU timing test) left the D3D cull mode at none
+    uint32_t saved_cull = g_state.rs[gpu::kRsCullMode];
+    static const std::string cull_env = std::getenv("UNCHAINED_PB_CULL") ? std::getenv("UNCHAINED_PB_CULL") : "";
+    uint32_t cull_on = g_state.simple[kMCullEnable >> 2] ? 1u : 0u;  // bring-up switch: off, cw, ccw, api
+    g_state.rs[gpu::kRsCullMode] = cull_env == "off"   ? 0u
+                                   : cull_env == "cw"  ? cull_on * 0x900u
+                                   : cull_env == "ccw" ? cull_on * 0x901u
+                                   : cull_env == "api" ? saved_cull
+                                                       : PushedCullMode();
     uint32_t saved_depth = g_state.rs[gpu::kRsZEnable];
     uint32_t pushed_depth = g_state.simple[kMDepthTest >> 2] ? (saved_depth ? saved_depth : 1u) : 0u;
     g_state.rs[gpu::kRsZEnable] = no_depth ? 0 : pushed_depth;
@@ -1771,10 +1809,12 @@ bool DrawPushed(uint32_t prim, const std::vector<uint32_t>& vertices) {
     // a frame buffer read as a texture is the one being drawn: the title pushes the address it was given at the start,
     // which the console's push buffer fixups would patch, and Swap rotates the buffers' memory (Whiplash's hyper mode
     // copied the shown frame, without its character mask, every other frame)
+    // the front buffer's first address reads the frame shown last (Whiplash's full screen effects sample it, 0x1D2CDC)
     auto frame_read = [](uint32_t offset) {
-        uint32_t rt = Dev(kDevRenderTarget);
+        uint32_t rt = Dev(kDevRenderTarget), o = offset & 0x7FFFFFFF;
+        if (g_buffer_count > 1 && o == g_first_front && o != g_first_back) return R32(g_buffers[0] + 4);
         for (uint32_t h : g_buffers)
-            if (h && rt && (R32(h + 4) & 0x7FFFFFFF) == (offset & 0x7FFFFFFF)) return R32(rt + 4);
+            if (h && rt && (R32(h + 4) & 0x7FFFFFFF) == o) return R32(rt + 4);
         return offset;
     };
     for (uint32_t s = 0; s < 4; s++)
@@ -1791,6 +1831,7 @@ bool DrawPushed(uint32_t prim, const std::vector<uint32_t>& vertices) {
     g_state.rs[gpu::kRsFogColor] = saved_fog_color;
     g_state.tss = saved_tss;
     g_state.rs[gpu::kRsZEnable] = saved_depth;
+    g_state.rs[gpu::kRsCullMode] = saved_cull;
     g_state.simple[kMBlendEnable >> 2] = saved_blend;
     g_state.rs[gpu::kRsPsTextureModes] = saved_modes;
     g_state.scissor_count = saved_scissor_count;
@@ -1920,6 +1961,15 @@ static void RunCommands(uint32_t begin, uint32_t end) {
     static int dumps = std::getenv("UNCHAINED_PB_DUMP") ? 2 : 0;
     static int skip = std::getenv("UNCHAINED_PB_DUMP") ? std::atoi(std::getenv("UNCHAINED_PB_DUMP")) : 0;
     static FILE* dump = nullptr;
+    // UNCHAINED_PB_DUMP_AT=S: the first two non-empty runs from S seconds after the first run (a frame in play)
+    static double dump_at = std::getenv("UNCHAINED_PB_DUMP_AT") ? std::atof(std::getenv("UNCHAINED_PB_DUMP_AT")) : -1;
+    static const auto first_run = std::chrono::steady_clock::now();
+    if (dump_at >= 0 && begin < end &&
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - first_run).count() >= dump_at) {
+        dump_at = -1;
+        dumps = 2;
+        skip = 0;
+    }
     if (dumps && skip > 0 && begin < end) skip--;
     if (dumps && !skip && !dump) dump = std::fopen("pbdump.txt", "w");
     FILE* df = dumps > 0 && !skip && begin < end ? dump : nullptr;
