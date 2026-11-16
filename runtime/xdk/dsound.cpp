@@ -777,8 +777,18 @@ void Start() {
 }
 
 // WAVEFORMATEX
+// UNCHAINED_DSOUND_LOG (or XBE_DSOUND_LOG): every voice made, played, fed and failed is logged, to find sounds a
+// title plays that never reach the mix
+bool Trace() {
+    static const bool on = std::getenv("UNCHAINED_DSOUND_LOG") || std::getenv("XBE_DSOUND_LOG");
+    return on;
+}
+
 void ReadFormat(Voice& v, uint32_t wfx) {
     if (!wfx) return;
+    if (Trace())
+        LOGI("dsound: %08X format tag %X, %u channels, %u Hz, %u bits", v.obj, R16(wfx), R16(wfx + 2), R32(wfx + 4),
+             R16(wfx + 14));
     v.tag = R16(wfx);
     v.channels = std::max<uint16_t>(R16(wfx + 2), 1);
     v.rate = R32(wfx + 4);
@@ -1159,6 +1169,7 @@ HLE_STDCALL(IDirectSound_CreateSoundBuffer, 4) { return NewBuffer(a[1], a[2]); }
     HLE_STDCALL(IDirectSoundBuffer_##name, nargs) {         \
         std::lock_guard<std::recursive_mutex> lock(g_lock); \
         Voice* v = Find(a[0]);                              \
+        if (!v && Trace()) LOGI("dsound: buffer " #name " on unknown %08X", a[0]); \
         return v ? buf_##name(*v, a) : 0x80004005u;         \
     }                                                       \
     static uint32_t buf_##name([[maybe_unused]] Voice& v, [[maybe_unused]] const Args& a)
@@ -1188,6 +1199,9 @@ BUFFER(SetBufferData, 3) {
     return 0;
 }
 BUFFER(Play, 4) {
+    if (Trace())
+        LOGI("dsound: %08X play %08X, %u bytes, flags %X, volume %.3f%s", v.obj, v.data, v.bytes, a[3], v.volume,
+             v.is3d ? ", 3D" : "");
     v.has_gain = false;  // a new sound does not ramp from the last one's levels
     v.playing = true;
     v.looping = a[3] & 1;
@@ -1372,6 +1386,7 @@ HLE_STDCALL(IDirectSound_CreateSoundStream, 4) { return NewStream(a[1], a[2]); }
         {                                                       \
             std::lock_guard<std::recursive_mutex> lock(g_lock); \
             Voice* v = Find(a[0]);                              \
+            if (!v && Trace()) LOGI("dsound: stream " #name " on unknown %08X", a[0]); \
             r = v ? str_##name(*v, a) : 0x80004005u;            \
             flushed.swap(t_flushed);                            \
         }                                                       \
@@ -1428,6 +1443,9 @@ STREAM(Process, 3) {
     uint32_t in = a[1];
     if (!in) return 0;
     Packet pk{R32(in), R32(in + 4), R32(in + 8), R32(in + 12), R32(in + 16)};
+    if (Trace() && !v.active)
+        LOGI("dsound: %08X stream starts, packet %08X %u bytes, volume %.3f%s%s", v.obj, R32(in), R32(in + 4), v.volume,
+             v.is3d ? ", 3D" : "", v.paused ? ", paused" : v.sync ? ", held for synch" : "");
     if (pk.completed_ptr) W32(pk.completed_ptr, 0);
     if (pk.status_ptr) W32(pk.status_ptr, kPacketPending);
     v.packets.push_back(pk);
@@ -1451,6 +1469,7 @@ STREAM(FlushEx, 4) {
     return 0;
 }
 STREAM(Pause, 2) {
+    if (Trace()) LOGI("dsound: %08X stream pause %u", v.obj, a[1]);
     v.paused = a[1] == 1;
     v.sync = a[1] == 2;
     return 0;
