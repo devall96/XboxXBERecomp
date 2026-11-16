@@ -244,10 +244,12 @@ const char* kVsEpilogue = R"(
         }
     }
     // hud_edge: the piece past the console's TV safe margin, out to its edges
-    if (hud.w != 0 && p.w == 1 && wide.w == 1 && wide.z != 2) {
+    if (hud.w == 1 && p.w == 1 && wide.w == 1 && wide.z != 2) {
         q.x += wide.z * hud.y;
         q.y -= hud.x * hud.z;
     }
+    // hud_visible off: the piece moved out of the picture
+    if (hud.w == 2 && p.w == 1) q.xy = float2(-4, -4);
     q.z = p.z * surf.z;
     q.xyz *= p.w;
     q.w = p.w;

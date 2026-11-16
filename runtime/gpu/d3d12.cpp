@@ -1802,6 +1802,11 @@ void D3D12Backend::FillWideConstants(DrawConstants& c) const {
     c.wide[1] = 1;
     c.wide[2] = draw_side_;
     c.wide[3] = draw_sided_ ? 1.0f : 0.0f;
+    // hud_visible off: the pieces at the screen's edges go (menus and centred text stay, as do full width passes)
+    if (!app::Get().hud_visible && draw_sided_ && draw_side_ != 2 && (draw_side_ != 0 || draw_vside_ != 0)) {
+        c.hud[3] = 2;
+        return;
+    }
     if (draw_sided_ && (draw_dx_ > 0 || draw_dy_ > 0)) {
         c.hud[0] = draw_vside_;
         c.hud[1] = 2 * draw_dx_ / guest_w_ / wide_;  // console pixels stay square in a widened frame
@@ -1811,7 +1816,10 @@ void D3D12Backend::FillWideConstants(DrawConstants& c) const {
 }
 
 // HUD pieces are placed when the frame is widened or hud_edge moves them out
-bool D3D12Backend::HudPlacing() const { return wide_ != 1.0f || app::Get().hud_edge > 0; }
+bool D3D12Backend::HudPlacing() const {
+    const app::Settings& s = app::Get();
+    return wide_ != 1.0f || s.hud_edge > 0 || !s.hud_visible;
+}
 
 // A HUD piece's side from its place on the console's screen: starting within 20% of the width from the left edge
 // and staying in the left 60% is a left piece, its mirror a right one, the full width stays as drawn (2), the rest
@@ -3706,7 +3714,8 @@ bool D3D12Backend::PresentPost(Target& t, const float uv[4], const D3D12_VIEWPOR
     float sw = t.w * uv[2], sh = t.h * uv[3];
     uint32_t dw = uint32_t(vp.Width), dh = uint32_t(vp.Height);
     bool upscale = st.upscaler == 1 && sw < dw && sh < dh;
-    if (!upscale && !st.sharpen && !grade) return false;
+    bool filter = st.colour_filter != 0 && st.colour_filter_strength != 0;
+    if (!upscale && !st.sharpen && !grade && !filter) return false;
     if (!dw || !dh || !EnsurePresentPipelines() || !EnsureMid(dw, dh)) return false;
     D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv = Cpu(rtv_heap_.Get(), kRtvCount + swap_->GetCurrentBackBufferIndex(), rtv_inc_);
 
@@ -3735,7 +3744,7 @@ bool D3D12Backend::PresentPost(Target& t, const float uv[4], const D3D12_VIEWPOR
     uint32_t slot = PresentViews(mid_.Get(), kBgra);
     struct {
         AU1 con[16];
-        float opts[4], grade0[4], grade1[4];
+        float opts[4], grade0[4], grade1[4], filter[4];
     } p{};
     constexpr float kSharpenStops = 2.0f;  // sharpen 1 is RCAS at 2 stops, 100 at 0 (its sharpest)
     FsrRcasCon(p.con, kSharpenStops * (1.0f - st.sharpen / 100.0f));
@@ -3749,6 +3758,8 @@ bool D3D12Backend::PresentPost(Target& t, const float uv[4], const D3D12_VIEWPOR
     p.grade0[3] = grade ? 1.0f : 0.0f;
     p.grade1[0] = st.grade_temperature / 100.0f;
     p.grade1[1] = st.grade_tint / 100.0f;
+    p.filter[0] = filter ? float(st.colour_filter) : 0.0f;
+    p.filter[1] = st.colour_filter_strength / 100.0f;
     Alloc cb = Upload(256, 256);
     std::memcpy(cb.cpu, &p, sizeof(p));
     DrawFullScreen(final_pso_.Get(), cb.gpu, slot);

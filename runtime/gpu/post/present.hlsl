@@ -20,6 +20,7 @@ cbuffer P : register(b1) {
     float4 opts;   // final: x sharpen, y gamma ramp, zw the viewport's top left in the target
     float4 grade0; // exposure (stops), contrast, saturation, 1 to grade
     float4 grade1; // temperature, tint (-1 to 1)
+    float4 filter; // x colour vision filter: 0 none, 1 protanopia, 2 deuteranopia, 3 tritanopia; y strength
 };
 
 float4 vs(uint id : SV_VertexID) : SV_Position {
@@ -52,6 +53,22 @@ float3 Grade(float3 c) {
     return saturate(c);
 }
 
+// colour vision: the picture as the given kind of colour blindness sees it (LMS cone space, Vienot, Brettel and
+// Mollon's projections), and what that loses shifted into the colours that remain (Fidaner, Lin and Ozguven's
+// daltonization)
+float3 Daltonize(float3 c, int kind) {
+    const float3x3 to_lms = float3x3(17.8824, 43.5161, 4.11935, 3.45565, 27.1554, 3.86714, 0.0299566, 0.184309, 1.46709);
+    const float3x3 to_rgb = float3x3(0.0809444479, -0.130504409, 0.116721066, -0.0102485335, 0.0540193266,
+                                     -0.113614708, -0.000365296938, -0.00412161469, 0.693511405);
+    float3 lms = mul(to_lms, c);
+    if (kind == 1) lms.x = 2.02344 * lms.y - 2.52581 * lms.z;
+    else if (kind == 2) lms.y = 0.494207 * lms.x + 1.24827 * lms.z;
+    else lms.z = -0.395913 * lms.x + 0.801109 * lms.y;
+    float3 err = c - mul(to_rgb, lms);
+    float3 shift = float3(0, 0.7 * err.r + err.g, 0.7 * err.r + err.b);
+    return saturate(c + shift * filter.y);
+}
+
 float4 ps_final(float4 pos : SV_Position) : SV_Target {
     int2 p = int2(pos.xy - opts.zw);
     float3 c;
@@ -59,5 +76,6 @@ float4 ps_final(float4 pos : SV_Position) : SV_Target {
     else c = img.Load(int3(p, 0)).rgb;
     if (opts.y > 0) c = float3(lut.Sample(ps, float2(c.r, 0.5)).r, lut.Sample(ps, float2(c.g, 0.5)).g, lut.Sample(ps, float2(c.b, 0.5)).b);
     if (grade0.w > 0) c = Grade(c);
+    if (filter.x > 0) c = Daltonize(c, int(filter.x));
     return float4(c, 1);
 }
