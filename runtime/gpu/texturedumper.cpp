@@ -11,6 +11,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -544,34 +545,17 @@ void NoteFolderChange(Clock::time_point now) {
 
 // UI upscaling
 
-constexpr uint8_t kSpreadAlpha = 128;  // a texel of the shapes, whose colour spreads
-
-// flat shapes: mostly clear and solid texels, few partly clear ones but at the shapes' edges (fonts, frames, hard
-// edged icons); glows, shadows and gradients (mostly partly clear) and opaque pictures are left as they are
-bool FlatShapes(const std::vector<uint8_t>& bgra) {
-    size_t n = bgra.size() / 4, clear = 0, solid = 0;
-    constexpr uint8_t kClear = 16, kSolid = 240;
-    for (size_t i = 0; i < n; i++) {
-        uint8_t a = bgra[i * 4 + 3];
-        clear += a < kClear;
-        solid += a >= kSolid;
-    }
-    size_t shape = n - clear, mid = shape - solid;
-    constexpr double kMinClear = 0.1, kMinSolid = 0.02, kMaxMid = 0.4;
-    return n && clear >= n * kMinClear && solid >= n * kMinSolid && mid <= shape * kMaxMid;
-}
-
-// Scale2x (EPX) on a mask: corners stay square, diagonal steps halve
-std::vector<uint8_t> Scale2x(const std::vector<uint8_t>& m, uint32_t w, uint32_t h) {
-    std::vector<uint8_t> out(size_t(w) * h * 4);
+// Scale2x (EPX) on labels: corners stay square, diagonal steps halve
+std::vector<int32_t> Scale2x(const std::vector<int32_t>& m, uint32_t w, uint32_t h) {
+    std::vector<int32_t> out(size_t(w) * h * 4);
     auto at = [&](int x, int y) {
         return m[size_t(std::clamp(y, 0, int(h) - 1)) * w + size_t(std::clamp(x, 0, int(w) - 1))];
     };
-    uint32_t W = w * 2;
+    size_t W = size_t(w) * 2;
     for (int y = 0; y < int(h); y++)
         for (int x = 0; x < int(w); x++) {
-            uint8_t p = at(x, y), a = at(x, y - 1), b = at(x + 1, y), c = at(x - 1, y), d = at(x, y + 1);
-            uint8_t* o = &out[size_t(y) * 2 * W + size_t(x) * 2];
+            int32_t p = at(x, y), a = at(x, y - 1), b = at(x + 1, y), c = at(x - 1, y), d = at(x, y + 1);
+            int32_t* o = &out[size_t(y) * 2 * W + size_t(x) * 2];
             o[0] = c == a && c != d && a != b ? a : p;
             o[1] = a == b && a != c && b != d ? b : p;
             o[W] = d == c && d != b && c != a ? c : p;
@@ -580,71 +564,165 @@ std::vector<uint8_t> Scale2x(const std::vector<uint8_t>& m, uint32_t w, uint32_t
     return out;
 }
 
-// kUiScale x the texels: the shapes' outline from Scale2x three times (8x) averaged 2x2, the colour bilinear from
-// the shapes' own texels (spread past their edges first, so no dark fringe comes in from clear texels)
+// Flat art: up to kMaxColours flat colours (transparency counted, colour of clear texels not) cover most texels -
+// a font, frame and box pieces with their see-through fills, the green terminal icons and lines - with few gentle
+// steps between neighbours. Each texel takes
+// its flat colour's label, the labels are scaled by Scale2x three times (8x) and averaged 2x2 to kUiScale x, and each
+// flat colour stays flat; a texel near none keeps its own colour, bilinear. Glows and gradients, painted pictures and
+// noise (labels changing at most texels) are not flat: false, left as they are.
 constexpr uint32_t kUiScale = 4;
 bool UpscaleFlat(std::vector<uint8_t>& bgra, uint32_t& w, uint32_t& h) {
+    constexpr int kMaxColours = 8;
+    constexpr float kNear = 40;            // premultiplied BGRA distance, 0-255 units, within a flat colour
+    constexpr double kMinCovered = 0.85;   // of the texels
+    constexpr double kMaxChanges = 0.3;    // label changes between neighbours in a row: past this, noise
     size_t n = size_t(w) * h;
-    std::vector<uint8_t> mask(n);
-    for (size_t i = 0; i < n; i++) mask[i] = bgra[i * 4 + 3] >= 128;
+    if (n < 4) return false;
+    std::vector<std::array<float, 4>> pm(n);
+    for (size_t i = 0; i < n; i++) {
+        float a = bgra[i * 4 + 3] / 255.0f;
+        pm[i] = {bgra[i * 4] * a, bgra[i * 4 + 1] * a, bgra[i * 4 + 2] * a, float(bgra[i * 4 + 3])};
+    }
+    auto dist2 = [](const std::array<float, 4>& p, const std::array<float, 4>& q) {
+        float s = 0;
+        for (int c = 0; c < 4; c++) s += (p[c] - q[c]) * (p[c] - q[c]);
+        return s;
+    };
+    // gradients and shading: many neighbours a small step apart (flat art steps nothing inside a shape, or a lot
+    // at its edge)
+    constexpr float kStep = 6;
+    constexpr double kMaxGentle = 0.06;  // of neighbour pairs: clouds 0.26, a shaded coin 0.08, a font 0.01
+    size_t gentle = 0, pairs = 0;
+    for (uint32_t y = 0; y < h; y++)
+        for (uint32_t x = 0; x < w; x++) {
+            size_t i = size_t(y) * w + x;
+            for (size_t j : {x + 1 < w ? i + 1 : i, y + 1 < h ? i + w : i}) {
+                if (j == i) continue;
+                float d = std::sqrt(dist2(pm[i], pm[j]));
+                gentle += d > kStep && d < kNear;
+                pairs++;
+            }
+        }
+    if (pairs && gentle > pairs * kMaxGentle) return false;
+    // the most common colours (to 8 levels a channel), each far enough from those taken before
+    std::unordered_map<uint32_t, uint32_t> hist;
+    auto bin = [](const std::array<float, 4>& p) {
+        uint32_t k = 0;
+        for (int c = 0; c < 4; c++) k = k << 8 | (uint32_t(p[c]) >> 3);
+        return k;
+    };
+    for (const auto& p : pm) hist[bin(p)]++;
+    std::vector<std::pair<uint32_t, uint32_t>> bins(hist.begin(), hist.end());
+    std::sort(bins.begin(), bins.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    std::vector<std::array<float, 4>> centres;
+    for (const auto& [k, count] : bins) {
+        if (int(centres.size()) == kMaxColours) break;
+        std::array<float, 4> c;
+        for (int i = 0; i < 4; i++) c[3 - i] = float(((k >> (8 * i)) & 0xFF) * 8 + 4);
+        bool close = false;
+        for (const auto& t : centres) close |= dist2(c, t) <= kNear * kNear;
+        if (!close) centres.push_back(c);
+    }
+    // a colour on the way between two flat colours is their blend (an anti-aliased edge, a glyph fading into its
+    // box): it goes to the nearer end, so the edge comes out sharp instead of as a band of its own
+    auto along = [](const std::array<float, 4>& c, const std::array<float, 4>& p, const std::array<float, 4>& q,
+                    float& t) {
+        float pq = 0, dot = 0;
+        for (int k = 0; k < 4; k++) {
+            pq += (q[k] - p[k]) * (q[k] - p[k]);
+            dot += (c[k] - p[k]) * (q[k] - p[k]);
+        }
+        t = pq > 0 ? dot / pq : 0;
+        if (t <= 0 || t >= 1) return 1e30f;
+        float d = 0;
+        for (int k = 0; k < 4; k++) {
+            float e = c[k] - (p[k] + (q[k] - p[k]) * t);
+            d += e * e;
+        }
+        return d;
+    };
+    std::vector<std::array<float, 4>> flat;
+    for (const auto& c : centres) {
+        bool blend = false;
+        float t;
+        for (size_t a = 0; a < flat.size() && !blend; a++)
+            for (size_t b = a + 1; b < flat.size() && !blend; b++) blend = along(c, flat[a], flat[b], t) <= kNear * kNear;
+        if (!blend) flat.push_back(c);
+    }
+    centres.swap(flat);
+    if (centres.size() < 2) return false;
+    std::vector<int32_t> label(n, -1);
+    size_t covered = 0;
+    for (size_t i = 0; i < n; i++) {
+        float best = kNear * kNear;
+        for (size_t c = 0; c < centres.size(); c++) {
+            float d = dist2(pm[i], centres[c]);
+            if (d <= best) {
+                best = d;
+                label[i] = int32_t(c);
+            }
+        }
+        for (size_t a = 0; a < centres.size() && label[i] < 0; a++)
+            for (size_t b = a + 1; b < centres.size(); b++) {
+                float t, d = along(pm[i], centres[a], centres[b], t);
+                if (d <= best) {
+                    best = d;
+                    label[i] = int32_t(t < 0.5f ? a : b);
+                }
+            }
+        covered += label[i] >= 0;
+    }
+    size_t changes = 0;
+    for (uint32_t y = 0; y < h; y++)
+        for (uint32_t x = 0; x + 1 < w; x++) changes += label[size_t(y) * w + x] != label[size_t(y) * w + x + 1];
+    if (covered < n * kMinCovered || (w > 1 && changes > (n - h) * kMaxChanges)) return false;
+    // each flat colour: its texels' average
+    std::vector<std::array<double, 4>> sum(centres.size(), {0, 0, 0, 0});
+    std::vector<size_t> members(centres.size());
+    for (size_t i = 0; i < n; i++) {
+        if (label[i] < 0) continue;
+        for (int c = 0; c < 4; c++) sum[size_t(label[i])][c] += pm[i][c];
+        members[size_t(label[i])]++;
+    }
+    for (size_t c = 0; c < centres.size(); c++)
+        for (int k = 0; k < 4; k++) centres[c][k] = members[c] ? float(sum[c][k] / members[c]) : centres[c][k];
+    std::vector<int32_t> big = label;
     uint32_t mw = w, mh = h;
     for (int pass = 0; pass < 3; pass++) {
-        mask = Scale2x(mask, mw, mh);
+        big = Scale2x(big, mw, mh);
         mw *= 2;
         mh *= 2;
     }
-    // colour spread out of the shapes: each clear texel takes its shaped neighbours' average, twice
-    std::vector<float> col(n * 3);
-    std::vector<uint8_t> has(n);
-    for (size_t i = 0; i < n; i++) {
-        has[i] = bgra[i * 4 + 3] >= kSpreadAlpha;
-        for (int c = 0; c < 3; c++) col[i * 3 + c] = bgra[i * 4 + c];
-    }
-    for (int pass = 0; pass < 2; pass++) {
-        std::vector<uint8_t> next = has;
-        std::vector<float> ncol = col;
-        for (int y = 0; y < int(h); y++)
-            for (int x = 0; x < int(w); x++) {
-                size_t i = size_t(y) * w + x;
-                if (has[i]) continue;
-                float sum[3] = {};
-                int k = 0;
-                for (int dy = -1; dy <= 1; dy++)
-                    for (int dx = -1; dx <= 1; dx++) {
-                        int nx = x + dx, ny = y + dy;
-                        if (nx < 0 || ny < 0 || nx >= int(w) || ny >= int(h)) continue;
-                        size_t j = size_t(ny) * w + nx;
-                        if (!has[j]) continue;
-                        for (int c = 0; c < 3; c++) sum[c] += col[j * 3 + c];
-                        k++;
-                    }
-                if (!k) continue;
-                for (int c = 0; c < 3; c++) ncol[i * 3 + c] = sum[c] / k;
-                next[i] = 1;
-            }
-        has.swap(next);
-        col.swap(ncol);
-    }
     uint32_t W = w * kUiScale, H = h * kUiScale;
     std::vector<uint8_t> out(size_t(W) * H * 4);
-    auto c_at = [&](int x, int y, int c) {
-        return col[(size_t(std::clamp(y, 0, int(h) - 1)) * w + size_t(std::clamp(x, 0, int(w) - 1))) * 3 + c];
+    // a texel near no flat colour: bilinear, premultiplied
+    auto own = [&](float fx, float fy) {
+        int x0 = int(std::floor(fx)), y0 = int(std::floor(fy));
+        float tx = fx - x0, ty = fy - y0;
+        auto at = [&](int x, int y) -> const std::array<float, 4>& {
+            return pm[size_t(std::clamp(y, 0, int(h) - 1)) * w + size_t(std::clamp(x, 0, int(w) - 1))];
+        };
+        std::array<float, 4> v;
+        for (int c = 0; c < 4; c++)
+            v[c] = (at(x0, y0)[c] * (1 - tx) + at(x0 + 1, y0)[c] * tx) * (1 - ty) +
+                   (at(x0, y0 + 1)[c] * (1 - tx) + at(x0 + 1, y0 + 1)[c] * tx) * ty;
+        return v;
     };
     for (uint32_t y = 0; y < H; y++)
         for (uint32_t x = 0; x < W; x++) {
-            float fx = (x + 0.5f) / kUiScale - 0.5f, fy = (y + 0.5f) / kUiScale - 0.5f;
-            int x0 = int(std::floor(fx)), y0 = int(std::floor(fy));
-            float tx = fx - x0, ty = fy - y0;
+            float acc[4] = {};
+            for (int sy = 0; sy < 2; sy++)
+                for (int sx = 0; sx < 2; sx++) {
+                    int32_t l = big[(size_t(y) * 2 + sy) * mw + size_t(x) * 2 + sx];
+                    std::array<float, 4> v = l >= 0 ? centres[size_t(l)]
+                                                    : own((x * 2 + sx + 0.5f) / (2 * kUiScale) - 0.5f,
+                                                          (y * 2 + sy + 0.5f) / (2 * kUiScale) - 0.5f);
+                    for (int c = 0; c < 4; c++) acc[c] += v[c] / 4;
+                }
             uint8_t* o = &out[(size_t(y) * W + x) * 4];
-            for (int c = 0; c < 3; c++) {
-                float v = (c_at(x0, y0, c) * (1 - tx) + c_at(x0 + 1, y0, c) * tx) * (1 - ty) +
-                          (c_at(x0, y0 + 1, c) * (1 - tx) + c_at(x0 + 1, y0 + 1, c) * tx) * ty;
-                o[c] = uint8_t(std::clamp(v + 0.5f, 0.0f, 255.0f));
-            }
-            // the 8x mask's 2x2 under this texel
-            size_t m = size_t(y) * 2 * mw + size_t(x) * 2;
-            int cover = mask[m] + mask[m + 1] + mask[m + mw] + mask[m + mw + 1];
-            o[3] = uint8_t(cover * 255 / 4);
+            float a = acc[3];
+            for (int c = 0; c < 3; c++) o[c] = uint8_t(std::clamp(a > 0 ? acc[c] * 255 / a : 0.0f, 0.0f, 255.0f) + 0.5f);
+            o[3] = uint8_t(std::clamp(a, 0.0f, 255.0f) + 0.5f);
         }
     bgra.swap(out);
     w = W;
@@ -713,7 +791,11 @@ bool Edit(uint64_t key, const TextureDesc& d, const uint8_t* guest, const uint32
         bool ok = wic && SUCCEEDED(LevelZeroBitmap(wic, img, dds, src)) &&
                   SUCCEEDED(src->CopyPixels(nullptr, img.width * 4, UINT(px.size()), px.data()));
         uint32_t w = img.width, h = img.height;
-        bool upscaled = ok && ui && FlatShapes(px) && UpscaleFlat(px, w, h);
+        uint32_t sw = w, sh = h;
+        bool upscaled = ok && ui && UpscaleFlat(px, w, h);
+        if (ok && ui) {
+            LOGI("ui texture %016llx %ux%u: %s", (unsigned long long)key, sw, sh, upscaled ? "flat, drawn 4x" : "left");
+        }
         bool edited = ok && game && app::kGame.texture_image(key, w, h, px);
         ok = (upscaled || edited) && w && h && px.size() == size_t(w) * h * 4;
         std::optional<Image> made;

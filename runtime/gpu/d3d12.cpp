@@ -669,11 +669,12 @@ private:
     float draw_y_[2] = {1, 0};
     float draw_x_[2] = {1, 0};  // MeasureDrawX: this draw's v0.x range
     void ChooseDrawSide(bool writes_depth);
+    bool DrawIs2D(const State& s, const Assembled& a, bool writes_depth) const;
     float draw_side_ = 0, draw_vside_ = 0;
     float draw_dx_ = 0, draw_dy_ = 0;  // console pixels the piece moves toward its edges
     bool HudPlacing() const;
     bool draw_sided_ = false;
-    bool draw_ui_ = false;  // this draw tests no depth and draws into the frame: its textures are 2D art
+    bool draw_ui_ = false;  // a 2D draw (DrawIs2D): its textures are 2D art
     struct SidedPiece {
         float lo, hi, top, bottom, side, vside, dx, dy;
     };
@@ -1973,7 +1974,7 @@ void D3D12Backend::MeasureDrawX(const Assembled& a, bool writes_depth) {
     draw_sided_ = false;
     draw_side_ = 0;
     constexpr uint32_t kMaxMeasured = 4096;  // 2D pieces are small; 3D never takes the 2D path
-    if (!HudPlacing() || !(a.regs & 1) || a.vertex_count > kMaxMeasured) return;
+    if (!(a.regs & 1) || a.vertex_count > kMaxMeasured) return;
     const VertexElement& e = a.elements[0];
     float lo = 1e30f, hi = -1e30f, top = 1e30f, bottom = -1e30f;
     auto take = [&](float x, float y) {
@@ -2003,7 +2004,22 @@ void D3D12Backend::MeasureDrawX(const Assembled& a, bool writes_depth) {
         draw_y_[0] = top;
         draw_y_[1] = bottom;
     }
-    ChooseDrawSide(writes_depth);
+    if (HudPlacing()) ChooseDrawSide(writes_depth);
+}
+
+uint32_t SimpleState(const State& s, uint32_t method);
+
+// a 2D draw (ui_upscale's textures): into the frame, writing no depth, with depth not tested or always passing, or
+// its positions on the screen already (0 to 1 across, as Whiplash's 2D programs take them, or pretransformed
+// pixels)
+bool D3D12Backend::DrawIs2D(const State& s, const Assembled& a, bool writes_depth) const {
+    if (!bound_rt_ || bound_rt_->gw != guest_w_ || bound_rt_->gh != guest_h_ || writes_depth) return false;
+    if (s.rs[kRsZEnable] == 0 || Cmp(SimpleState(s, kMZFunc)) == D3D12_COMPARISON_FUNC_ALWAYS) return true;
+    if (draw_x_[0] > draw_x_[1]) return false;
+    constexpr float kUnitSlack = 0.05f;
+    bool unit = draw_x_[0] >= -kUnitSlack && draw_x_[1] <= 1 + kUnitSlack && draw_y_[0] >= -kUnitSlack &&
+                draw_y_[1] <= 1 + kUnitSlack;
+    return unit || a.pretransformed;
 }
 
 float D3D12Backend::TargetScale() const {
@@ -3311,7 +3327,10 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
 
     // stage textures, then the pixel shader made for them
     DrawTextures stages;
-    draw_ui_ = s.rs[kRsZEnable] == 0 && bound_rt_ && bound_rt_->gw == guest_w_ && bound_rt_->gh == guest_h_;
+    // the vertices' screen range first: HUD placement and whether the textures are 2D art
+    bool writes_depth = s.rs[kRsZEnable] != 0 && SimpleState(s, kMZWriteEnable) != 0;
+    MeasureDrawX(a, writes_depth);
+    draw_ui_ = DrawIs2D(s, a, writes_depth);
     if (!BindStageTexturesAndTargets(s, stages)) return;
     PixelKey pk = MakePixelKey(s, stages.info);
     pk.quad = sh.quad;
@@ -3333,7 +3352,6 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     GuestExtent size;
     SurfaceSize(bound_rt_ ? s.rt : s.zs, size.w, size.h);
     DrawConstants c{};
-    MeasureDrawX(a, k.zwrite && k.zen);
     UploadConstants(s, sh, k, stages, size, c);
     if (ext_) binds_ = {};
 
