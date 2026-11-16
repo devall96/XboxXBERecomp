@@ -45,6 +45,10 @@ uint64_t Key(const TextureDesc& d, const FormatInfo& fi, const uint8_t* guest, c
 // once per key while dumping: PNG level 0, or DDS with every level in the format the renderer uploads
 void Dump(uint64_t key, const TextureDesc& d, const uint8_t* guest, const uint32_t* palette);
 
+// a texture the game edits (GameInfo::texture_image): its picture made on the worker from the console's; false
+// when the game leaves it alone. Take then gives the edited picture.
+bool Edit(uint64_t key, const TextureDesc& d, const uint8_t* guest, const uint32_t* palette);
+
 // Ready moves the image into out; the first ask starts loading it off the calling thread.
 // None: replacement off, no pack image for key, or its file did not load
 Lookup Take(uint64_t key, Image& out);

@@ -87,6 +87,16 @@ Pad Poll(int port) {
         UpdatePads();
         if (SDL_Gamepad* pad = port >= 0 && port < 4 ? g_pads[port] : nullptr) {
             p.connected = true;
+            switch (SDL_GetGamepadType(pad)) {
+                case SDL_GAMEPAD_TYPE_PS3:
+                case SDL_GAMEPAD_TYPE_PS4:
+                case SDL_GAMEPAD_TYPE_PS5: p.family = kPlayStation; break;
+                case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO:
+                case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
+                case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT:
+                case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR: p.family = kNintendo; break;
+                default: p.family = kXbox; break;
+            }
             constexpr SDL_GamepadButton kButtons[] = {
                 SDL_GAMEPAD_BUTTON_DPAD_UP,   SDL_GAMEPAD_BUTTON_DPAD_DOWN,  SDL_GAMEPAD_BUTTON_DPAD_LEFT,
                 SDL_GAMEPAD_BUTTON_DPAD_RIGHT, SDL_GAMEPAD_BUTTON_START,     SDL_GAMEPAD_BUTTON_BACK,

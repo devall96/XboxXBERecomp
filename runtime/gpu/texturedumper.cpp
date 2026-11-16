@@ -11,6 +11,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -76,7 +77,9 @@ struct Pack {
     std::unordered_set<uint64_t> asked;
     std::unordered_map<uint64_t, std::optional<Image>> loaded;  // empty: the file did not load
     std::unordered_set<uint64_t> dumped;
+    std::unordered_set<uint64_t> edited;  // keys GameInfo::texture_image makes, the render thread's
 };
+std::atomic<bool> g_refresh{false};
 
 Pack g;
 
@@ -558,8 +561,51 @@ bool UpdatePackFiles() {
 bool Update() {
     bool changed = LatchSettings();
     bool reloaded = g.set.replacing && UpdatePackFiles();
-    if (changed || reloaded) g.generation++;
-    return reloaded;
+    bool refresh = g_refresh.exchange(false);
+    if (refresh) {
+        g.edited.clear();
+        std::lock_guard l(g.lock);
+        g.revision++;
+        g.asked.clear();
+        g.loaded.clear();
+    }
+    if (changed || reloaded || refresh) g.generation++;
+    return reloaded || refresh;
+}
+
+bool Edit(uint64_t key, const TextureDesc& d, const uint8_t* guest, const uint32_t* palette) {
+    const app::GameInfo& gi = app::kGame;
+    if (!key || !gi.texture_edits || !gi.texture_image || !gi.texture_edits(key)) return false;
+    if (!g.edited.insert(key).second) return true;
+    uint32_t revision;
+    {
+        std::lock_guard l(g.lock);
+        revision = g.revision;
+    }
+    TextureDesc top = d;
+    top.levels = 1;
+    Post([key, revision, img = Decode(top, guest, palette)] {
+        IWICImagingFactory* wic = Wic();
+        std::vector<uint8_t> dds;
+        ComPtr<IWICBitmapSource> src;
+        std::vector<uint8_t> px(size_t(img.width) * img.height * 4);
+        bool ok = wic && SUCCEEDED(LevelZeroBitmap(wic, img, dds, src)) &&
+                  SUCCEEDED(src->CopyPixels(nullptr, img.width * 4, UINT(px.size()), px.data()));
+        uint32_t w = img.width, h = img.height;
+        ok = ok && app::kGame.texture_image(key, w, h, px) && w && h && px.size() == size_t(w) * h * 4;
+        std::optional<Image> made;
+        if (ok) {
+            made.emplace();
+            made->format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            made->width = w;
+            made->height = h;
+            made->levels.push_back({std::move(px), w * 4});
+            AddMipmaps(*made);
+        }
+        std::lock_guard l(g.lock);
+        if (revision == g.revision) g.loaded[key] = std::move(made);
+    });
+    return true;
 }
 
 uint32_t Generation() { return g.generation; }
@@ -567,7 +613,7 @@ uint32_t Generation() { return g.generation; }
 bool Replacing() { return g.set.replacing && !g.files.empty(); }
 
 uint64_t Key(const TextureDesc& d, const FormatInfo& fi, const uint8_t* guest, const uint32_t* palette) {
-    if (!Replacing() && !g.set.dumping) return 0;
+    if (!Replacing() && !g.set.dumping && !app::kGame.texture_edits) return 0;
     // cube maps, volumes and depth stay the console's; linear ones are movie frames and the game's own copies
     if (d.cube || d.depth > 1 || d.linear || UploadFormat(fi.host) == DXGI_FORMAT_UNKNOWN) return 0;
     uint32_t shape[] = {d.format, d.width, d.height};
@@ -594,6 +640,15 @@ void Dump(uint64_t key, const TextureDesc& d, const uint8_t* guest, const uint32
 }
 
 Lookup Take(uint64_t key, Image& out) {
+    if (g.edited.count(key)) {
+        std::lock_guard l(g.lock);
+        auto it = g.loaded.find(key);
+        if (it == g.loaded.end()) return Lookup::Loading;
+        if (!it->second) return Lookup::None;
+        out = std::move(*it->second);
+        g.loaded.erase(it);
+        return Lookup::Ready;
+    }
     auto file = g.files.find(key);
     if (!g.set.replacing || file == g.files.end()) return Lookup::None;
     uint32_t revision = 0;
@@ -614,3 +669,5 @@ Lookup Take(uint64_t key, Image& out) {
 }
 
 }  // namespace gpu::texturedumper
+
+void app::RefreshTextureImages() { gpu::texturedumper::g_refresh = true; }

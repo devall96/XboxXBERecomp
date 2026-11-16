@@ -2336,7 +2336,8 @@ void D3D12Backend::LatchPackKey(Tex& tx, const TextureDesc& d, const FormatInfo&
     uint64_t key = texturedumper::Key(d, fi, p, colours);
     texturedumper::Dump(key, d, p, colours);
     // dumping alone keys the bytes too: the pack image is not drawn then
-    tx.pack_key = texturedumper::Replacing() ? key : 0;
+    bool edited = texturedumper::Edit(key, d, p, colours);
+    tx.pack_key = edited || texturedumper::Replacing() ? key : 0;
 }
 
 // the pack image for tx's bytes once it has loaded; textures with the same bytes share its GPU copy

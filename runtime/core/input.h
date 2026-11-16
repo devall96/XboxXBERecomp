@@ -9,7 +9,9 @@ struct Pad {
     uint16_t buttons = 0;  // dpad up/down/left/right, start, back, left thumb, right thumb
     uint8_t analog[8] = {};  // A B X Y black white left trigger right trigger
     int16_t lx = 0, ly = 0, rx = 0, ry = 0;
+    uint8_t family = 0;  // the controller's maker by SDL's gamepad type: kXbox, kPlayStation or kNintendo
 };
+enum Family : uint8_t { kXbox, kPlayStation, kNintendo };
 
 void Init();  // window thread, before boot; the game code window starts it earlier
 uint16_t HeldOnAnyController();  // face buttons as XINPUT_GAMEPAD_A/B/X/Y masks, GameInfo::pad left out
