@@ -1747,6 +1747,19 @@ bool DrawPushed(uint32_t prim, const std::vector<uint32_t>& vertices) {
     g_state.vs_handle = g_pushed.programmable ? vs->handle : (vs->handle & ~1u);
     // bring-up switch: UNCHAINED_PB_NOPS draws pushed primitives with the texture stages instead of the pushed combiners
     static const bool no_ps = std::getenv("UNCHAINED_PB_NOPS") != nullptr;
+    // the pushed surface clip bounds every pushed draw, whatever viewport an API call set since (Whiplash's intro drew
+    // past its 448 lines, under the letterbox, after a SetViewport cleared the scissor the surface switch had set)
+    uint32_t saved_scissor_count = g_state.scissor_count;
+    auto saved_scissor = std::array<uint32_t, 4>{g_state.scissors[0], g_state.scissors[1], g_state.scissors[2],
+                                                 g_state.scissors[3]};
+    if (uint32_t ch = g_state.simple[0x200 >> 2], cv = g_state.simple[0x204 >> 2]; ch >> 16 && cv >> 16) {
+        bool swz = (g_state.simple[0x208 >> 2] >> 8 & 0xF) == 2;
+        g_state.scissor_count = 1;
+        g_state.scissors[0] = ch & 0xFFFF;
+        g_state.scissors[1] = cv & 0xFFFF;
+        g_state.scissors[2] = swz ? 1u << (g_state.simple[0x208 >> 2] >> 16 & 0xFF) : (ch & 0xFFFF) + (ch >> 16);
+        g_state.scissors[3] = swz ? 1u << (g_state.simple[0x208 >> 2] >> 24 & 0xFF) : (cv & 0xFFFF) + (cv >> 16);
+    }
     // the stage modes come from the pushed shader stage program, not the D3D state an API call left: Whiplash's
     // hyper mode reads the back buffer at stage 1, which the API state had off (its picture went black)
     uint32_t saved_modes = g_state.rs[gpu::kRsPsTextureModes];
@@ -1780,6 +1793,8 @@ bool DrawPushed(uint32_t prim, const std::vector<uint32_t>& vertices) {
     g_state.rs[gpu::kRsZEnable] = saved_depth;
     g_state.simple[kMBlendEnable >> 2] = saved_blend;
     g_state.rs[gpu::kRsPsTextureModes] = saved_modes;
+    g_state.scissor_count = saved_scissor_count;
+    for (int i = 0; i < 4; i++) g_state.scissors[i] = saved_scissor[i];
     return true;
 }
 }  // namespace

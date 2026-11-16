@@ -7,7 +7,11 @@
 #include <condition_variable>
 #include <deque>
 #include <map>
+#include <cstdio>
+#include <cstdlib>
 #include <optional>
+#include <filesystem>
+#include <set>
 #include <vector>
 
 #include "audio/audio.h"
@@ -238,6 +242,9 @@ struct Voice {
     float p[3] = {}, min_dist = 1, max_dist = 1e9f;
     Gains gain = {};  // the last block's gains, the next block ramps from them
     bool has_gain = false;
+    float peak = 0;            // the loudest level the current play reached on any speaker bin (trace)
+    uint32_t mixed = 0;        // frames of it mixed (trace)
+    uint32_t traced_start = 0, traced_len = 0;  // its region (trace)
     // a mono 3D voice's interaural delay in samples and its recent samples
     float itd = 0;
     float ear[kEarLength] = {};
@@ -723,7 +730,9 @@ void MixVoice(Voice& v, float* bins, uint32_t frames) {
         for (Lane& lane : lanes) {
             lane.gain += lane.step;
             frame[lane.bin] += row[lane.row] * lane.gain;
+            if (lane.bin < audio::kChannels) v.peak = std::max(v.peak, std::fabs(lane.gain));
         }
+        v.mixed++;
         v.pos += rate;
     }
     v.gain = target;
@@ -1200,6 +1209,35 @@ BUFFER(SetBufferData, 3) {
 }
 BUFFER(Play, 4) {
     if (Trace()) {
+        // what the play before this one on the voice came to: the loudest speaker level and its length
+        if (v.mixed)
+            LOGI("dsound: %08X played region %X+%X, peak %.4f over %u frames", v.obj, v.traced_start, v.traced_len,
+                 v.peak, v.mixed);
+        v.peak = 0;
+        v.mixed = 0;
+        v.traced_start = v.play_start;
+        v.traced_len = v.play_len;
+        // each distinct sound once as a WAV in dsound_trace\, named by its region, to listen to the silent ones
+        static std::set<uint64_t> dumped;
+        uint64_t key = uint64_t(v.data + v.play_start) << 32 | v.play_len;
+        if (v.data && v.play_len && dumped.insert(key).second) {
+            std::error_code ec;
+            std::filesystem::create_directory("dsound_trace", ec);
+            char name[96];
+            std::snprintf(name, sizeof(name), "dsound_trace\\%08X_%X.wav", v.data + v.play_start, v.play_len);
+            if (FILE* f = std::fopen(name, "wb")) {
+                uint32_t frames = FramesOf(v, v.play_len), rate = v.freq ? v.freq : v.rate, ch = 1;
+                uint32_t bytes = frames * 2;
+                auto put32 = [&](uint32_t x) { std::fwrite(&x, 4, 1, f); };
+                auto put16 = [&](uint16_t x) { std::fwrite(&x, 2, 1, f); };
+                std::fwrite("RIFF", 1, 4, f); put32(36 + bytes); std::fwrite("WAVEfmt ", 1, 8, f);
+                put32(16); put16(1); put16(uint16_t(ch)); put32(rate); put32(rate * 2); put16(2); put16(16);
+                std::fwrite("data", 1, 4, f); put32(bytes);
+                for (uint32_t i = 0; i < frames; i++)
+                    put16(uint16_t(int16_t(std::clamp(Sample(v, v.data + v.play_start, i, 0), -1.0f, 1.0f) * 32767)));
+                std::fclose(f);
+            }
+        }
         char bins[160] = "";
         for (uint32_t i = 0, n = 0; i < v.nbins && n < sizeof(bins) - 16; i++)
             n += std::snprintf(bins + n, sizeof(bins) - n, " %u:%d", v.bin[i], v.bin_mb[v.bin[i]]);
