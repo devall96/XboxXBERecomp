@@ -1747,8 +1747,14 @@ bool DrawPushed(uint32_t prim, const std::vector<uint32_t>& vertices) {
     g_state.vs_handle = g_pushed.programmable ? vs->handle : (vs->handle & ~1u);
     // bring-up switch: UNCHAINED_PB_NOPS draws pushed primitives with the texture stages instead of the pushed combiners
     static const bool no_ps = std::getenv("UNCHAINED_PB_NOPS") != nullptr;
+    // the stage modes come from the pushed shader stage program, not the D3D state an API call left: Whiplash's
+    // hyper mode reads the back buffer at stage 1, which the API state had off (its picture went black)
+    uint32_t saved_modes = g_state.rs[gpu::kRsPsTextureModes];
     if (no_ps) g_state.ps = nullptr;
-    else if (auto ps = PushedPixelShader()) g_state.ps = ps;
+    else if (auto ps = PushedPixelShader()) {
+        g_state.ps = ps;
+        g_state.rs[gpu::kRsPsTextureModes] = g_state.simple[kMShaderStageProgram >> 2];
+    }
     for (uint32_t s = 0; s < 4; s++)
         g_state.textures[s] = g_pushed.tex_control[s] & kTexEnable && g_pushed.tex_format[s]
                                   ? PushedTextureHeader(g_pushed.tex_offset[s], g_pushed.tex_format[s],
@@ -1764,6 +1770,7 @@ bool DrawPushed(uint32_t prim, const std::vector<uint32_t>& vertices) {
     g_state.tss = saved_tss;
     g_state.rs[gpu::kRsZEnable] = saved_depth;
     g_state.simple[kMBlendEnable >> 2] = saved_blend;
+    g_state.rs[gpu::kRsPsTextureModes] = saved_modes;
     return true;
 }
 }  // namespace
