@@ -151,6 +151,10 @@ struct GameInfo {
     // a render target's host pixels per console pixel in place of the render scale (a shadow map drawn finer), 0 for
     // the render scale; data is the surface's virtual address, a depth target shares its colour target's size
     float (*target_scale)(uint32_t data, uint32_t gw, uint32_t gh, bool depth, float render_scale) = nullptr;
+    // only the release this executable was made from (and `releases`) starts: another is refused with release_name,
+    // the expected SHA-1 and the one found, instead of offered at the player's risk
+    bool one_release = false;
+    const wchar_t* release_name = nullptr;
 };
 extern const GameInfo kGame;
 

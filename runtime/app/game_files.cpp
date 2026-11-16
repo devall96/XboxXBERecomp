@@ -9,6 +9,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cstring>
 #include <cwctype>
 #include <fstream>
 #include <string_view>
@@ -121,6 +122,18 @@ bool FindGame(GameFiles& game) {
 
     if (other_name.empty()) {
         MessageBoxW(nullptr, kGame.missing, kGame.short_title, MB_ICONERROR);
+        return false;
+    }
+    if (kGame.one_release) {
+        // only the release this build was made from: name it and what was found, and stop
+        std::string found = Sha1(other.xbe);
+        std::wstring text = other_name.filename().wstring() + L" is a different release of the game.\n\n" +
+                            (kGame.release_name ? std::wstring(kGame.release_name) + L"\n\n" : std::wstring()) +
+                            L"Expected " + std::wstring(IMAGE_XBE, IMAGE_XBE + std::strlen(IMAGE_XBE)) + L" SHA-1 " +
+                            std::wstring(kImageSha1, kImageSha1 + std::strlen(kImageSha1)) + L"\nFound    " +
+                            std::wstring(found.begin(), found.end());
+        LOGE("game: %s is another release (sha1 %s), refused", other_name.string().c_str(), found.c_str());
+        MessageBoxW(nullptr, text.c_str(), kGame.short_title, MB_ICONERROR);
         return false;
     }
     std::wstring text = other_name.filename().wstring() +
