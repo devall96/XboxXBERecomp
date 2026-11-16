@@ -406,6 +406,7 @@ struct DrawTextures {
     bool rt[4] = {};            // stage samples a render target
     float k[4] = {1, 1, 1, 1};  // Extension::Sample's k
     float wide[4] = {};         // host texels per console texel of a target read into a smaller one, 0 otherwise
+    uint32_t tsize[4][2] = {};  // a linear texture laid on a target: the target's console size, its texel scale
 };
 
 // what the last draw set on the command list, so the next one sets only what differs; anything else that sets them
@@ -1715,6 +1716,12 @@ ID3D12Resource* D3D12Backend::BindTargetTexture(const State& s, int stage, const
         info.flags |= kTexWide;
     }
     if (ext_) ext_->Sampled(d, &t, 0, info);
+    // a linear texture's coordinates are texels of the memory under it: one that names part of a target (Whiplash
+    // reads its 640 by 480 back buffer as 640 by 448) divides by the target's size, else each copy shrinks the picture
+    if (d.linear) {
+        stages.tsize[stage][0] = t.gw;
+        stages.tsize[stage][1] = t.gh;
+    }
     sv.Format = t.depth ? kDepthRead : t.fmt;
     // the console reads the pixels it is about to overwrite: give the draw a copy
     if (feedback) return Feedback(t);
@@ -1947,6 +1954,7 @@ ID3D12Resource* D3D12Backend::BindTexture(const State& s, int stage, DrawTexture
     stages.rt[stage] = false;
     stages.k[stage] = 1;
     stages.wide[stage] = 0;
+    stages.tsize[stage][0] = stages.tsize[stage][1] = 0;
     sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     sv.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -2255,6 +2263,10 @@ void D3D12Backend::FillTexelConstants(int i, const TextureDesc& d, const DrawTex
     c.texsize[i][0] = float(d.width);
     c.texsize[i][1] = float(d.height);
     if (!stages.rt[i]) return;
+    if (stages.tsize[i][0] && stages.tsize[i][1]) {
+        c.texsize[i][0] = float(stages.tsize[i][0]);
+        c.texsize[i][1] = float(stages.tsize[i][1]);
+    }
     float k = stages.k[i];
     // a 3 console texel box per tap keeps the console chain's glow width and brightness
     if (stages.wide[i] > 0) {
