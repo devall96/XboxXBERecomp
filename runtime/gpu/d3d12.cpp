@@ -2806,10 +2806,11 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const 
 // what a pass adds; captures still list them
 bool D3D12Backend::SkippedByTexture(const State& s) {
     const auto& skip = diag::SkipTextures();
-    if (skip.empty()) return false;
+    if (skip.empty() && !app::kGame.skip_texture) return false;
     for (int i = 0; i < 4; i++) {
         TextureDesc d;
         if (!s.textures[size_t(i)] || !Describe(s.textures[size_t(i)], d)) continue;
+        if (app::kGame.skip_texture && app::kGame.skip_texture(d.data)) return true;
         for (uint32_t t : skip)
             if ((d.data & 0x0FFFFFFF) == (t & 0x0FFFFFFF)) return true;
     }

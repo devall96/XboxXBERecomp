@@ -65,6 +65,7 @@ void Load() {
     s.join_ip = t["join_ip"].value_or(s.join_ip);
     s.save_folder = t["save_folder"].value_or(s.save_folder);
     s.save_backups = t["save_backups"].value_or(s.save_backups);
+    s.save_profile = t["save_profile"].value_or(s.save_profile);
     s.audio_output = std::min(t["audio_output"].value_or(s.audio_output), audio::kOutputMono);
     std::string wide = t["widescreen"].value_or(std::string(kWide[uint32_t(s.widescreen)]));
     for (uint32_t i = 0; i < 3; i++)
@@ -107,6 +108,7 @@ toml::table Table() {
                   {"join_ip", s.join_ip},
                   {"save_folder", s.save_folder},
                   {"save_backups", int64_t(s.save_backups)},
+                  {"save_profile", s.save_profile},
                   {"audio_output", int64_t(s.audio_output)},
                   {"widescreen", kWide[uint32_t(s.widescreen)]},
                   {"upscaler", int64_t(s.upscaler)},

@@ -8,6 +8,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cctype>
 #include <ctime>
 #include <system_error>
 #include <vector>
@@ -19,13 +20,19 @@ namespace app {
 
 namespace fs = std::filesystem;
 
+// save_profile: a name keeps its own disk in "profiles\<name>" (its saves and their backups); empty is the main one
 fs::path HardDisk() {
     std::wstring hdd = Instance() > 1 ? L"hdd" + std::to_wstring(Instance()) : L"hdd";
     const std::string& custom = Get().save_folder;
-    if (custom.empty()) return ExeDir() / hdd;
-    // a second instance keeps its own disk beside the player's
-    fs::path base = fs::u8path(custom);
+    fs::path base = custom.empty() ? ExeDir() : fs::u8path(custom);
     if (base.is_relative()) base = ExeDir() / base;
+    std::string profile;
+    for (char c : Get().save_profile)  // a folder name: letters, digits, space, - and _
+        if (std::isalnum(static_cast<unsigned char>(c)) || c == ' ' || c == '-' || c == '_') profile += c;
+    if (!profile.empty()) base = base / "profiles" / fs::u8path(profile);
+    // the main disk is hdd beside the exe; a custom folder or a profile is the disk itself, a second instance's
+    // beside it
+    if (custom.empty() && profile.empty()) return base / hdd;
     return Instance() > 1 ? base / hdd : base;
 }
 
@@ -51,7 +58,10 @@ void BackupSaves() {
     fs::path saves = HardDisk() / kSaves;
     std::error_code ec;
     if (!keep || !fs::exists(saves, ec) || !FileCount(saves)) return;
-    fs::path root = HardDisk().parent_path() / L"save backups";
+    // beside the disk; a profile's or a custom folder's own, named after it
+    fs::path disk = HardDisk();
+    std::wstring name = disk.filename().wstring();
+    fs::path root = disk.parent_path() / (name == L"hdd" ? std::wstring(L"save backups") : L"save backups " + name);
     if (Instance() > 1) root += std::to_wstring(Instance());
     std::time_t now = std::time(nullptr);
     std::tm tm{};

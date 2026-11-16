@@ -59,6 +59,7 @@ struct Settings {
     std::string join_ip;                   // co-op: a host past the LAN the system link search also asks
     std::string save_folder;               // the console's hard disk (saves), empty for hdd beside the exe
     uint32_t save_backups = 5;             // copies of the saves made at each start and kept, 0 for none
+    std::string save_profile;              // a named set of saves (profiles\<name>), empty for the main one
 };
 
 Settings& Get();
@@ -161,6 +162,8 @@ struct GameInfo {
     // the disc path ("Game.ini", "map\\hub.mxb"); true with host set takes it; kernel::ReadOriginalGameFile reads
     // the disc's own
     bool (*disc_file)(const std::string& path, std::filesystem::path& host) = nullptr;
+    // a draw sampling this texture (its virtual address) is left out: an effect the player turned off
+    bool (*skip_texture)(uint32_t data) = nullptr;
     const wchar_t* release_name = nullptr;
 };
 extern const GameInfo kGame;
