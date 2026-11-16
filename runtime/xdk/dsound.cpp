@@ -1199,9 +1199,13 @@ BUFFER(SetBufferData, 3) {
     return 0;
 }
 BUFFER(Play, 4) {
-    if (Trace())
-        LOGI("dsound: %08X play %08X, %u bytes, flags %X, volume %.3f%s", v.obj, v.data, v.bytes, a[3], v.volume,
-             v.is3d ? ", 3D" : "");
+    if (Trace()) {
+        char bins[160] = "";
+        for (uint32_t i = 0, n = 0; i < v.nbins && n < sizeof(bins) - 16; i++)
+            n += std::snprintf(bins + n, sizeof(bins) - n, " %u:%d", v.bin[i], v.bin_mb[v.bin[i]]);
+        LOGI("dsound: %08X play region %X+%X, %u Hz, flags %X, volume %.3f%s, bins%s", v.obj, v.play_start, v.play_len,
+             v.freq ? v.freq : v.rate, a[3], v.volume, v.is3d ? ", 3D" : "", v.nbins ? bins : " none");
+    }
     v.has_gain = false;  // a new sound does not ramp from the last one's levels
     v.playing = true;
     v.looping = a[3] & 1;
@@ -1228,7 +1232,10 @@ BUFFER(Pause, 2) {
 BUFFER(SetEG, 2) { return 0; }
 // (this, start, length) in bytes, 0 length plays to the end. The loop becomes the whole region.
 BUFFER(SetPlayRegion, 3) {
-    if (a[1] > v.bytes || a[2] > v.bytes - a[1]) return 0x88780032u;  // DSERR_INVALIDCALL
+    if (a[1] > v.bytes || a[2] > v.bytes - a[1]) {
+        if (Trace()) LOGI("dsound: %08X play region %X+%X refused, %u bytes", v.obj, a[1], a[2], v.bytes);
+        return 0x88780032u;  // DSERR_INVALIDCALL
+    }
     v.play_start = a[1];
     v.play_len = v.loop_len = a[2] ? a[2] : v.bytes - a[1];
     v.loop_start = 0;
