@@ -27,7 +27,7 @@ const char* kModes[] = {"fullscreen", "borderless", "windowed"};
 const char* kWide[] = {"console", "off", "expand"};
 const char* kVSync[] = {"off", "on", "adaptive", "fast", "vrr"};
 
-std::filesystem::path File() { return ExeDir() / kGame.settings; }
+std::filesystem::path File() { return DataDir() / kGame.settings; }
 
 }  // namespace
 

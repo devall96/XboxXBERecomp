@@ -129,7 +129,7 @@ fs::path WorkDir(const Image& image) { return CompilerDir() / "work" / image.exe
 fs::path CodeDll(const Image& image) { return ExeDir() / (image.exe + L".dll"); }
 fs::path StampFile(const Image& image) { return WorkDir(image) / "built.txt"; }
 std::wstring Quote(const fs::path& path) { return L"\"" + path.wstring() + L"\""; }
-fs::path CompileLog() { return ExeDir() / "logs" / "compile.log"; }
+fs::path CompileLog() { return DataDir() / "logs" / "compile.log"; }
 
 // keeps the failed step for the message the player sees; false, to return
 bool RecordFailure(const std::wstring& what) {

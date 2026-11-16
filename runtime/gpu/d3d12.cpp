@@ -143,7 +143,7 @@ private:
         if (opened_) return;
         opened_ = true;
         std::error_code ec;
-        std::filesystem::path dir = app::ExeDir() / "cache";
+        std::filesystem::path dir = app::DataDir() / "cache";
         std::filesystem::create_directories(dir, ec);
         std::filesystem::path path = dir / (app::Instance() > 1 ? "shaders" + std::to_string(app::Instance()) + ".bin"
                                                                : std::string("shaders.bin"));
@@ -3543,7 +3543,7 @@ void D3D12Backend::StartCapture() {
     char stamp[32];
     snprintf(stamp, sizeof(stamp), "%02u%02u%02u", tm.wHour, tm.wMinute, tm.wSecond);
     std::error_code ec;
-    cap_dir_ = std::filesystem::weakly_canonical(app::ExeDir() / diag::CaptureDir() / stamp, ec);
+    cap_dir_ = std::filesystem::weakly_canonical(app::DataDir() / diag::CaptureDir() / stamp, ec);
     std::filesystem::create_directories(cap_dir_, ec);
     cap_ = _wfopen((cap_dir_ / "frame.txt").c_str(), L"w");
     cap_i_ = cap_rt_ = 0;

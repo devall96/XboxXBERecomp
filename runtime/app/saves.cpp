@@ -24,8 +24,8 @@ namespace fs = std::filesystem;
 fs::path HardDisk() {
     std::wstring hdd = Instance() > 1 ? L"hdd" + std::to_wstring(Instance()) : L"hdd";
     const std::string& custom = Get().save_folder;
-    fs::path base = custom.empty() ? ExeDir() : fs::u8path(custom);
-    if (base.is_relative()) base = ExeDir() / base;
+    fs::path base = custom.empty() ? DataDir() : fs::u8path(custom);
+    if (base.is_relative()) base = DataDir() / base;
     std::string profile;
     for (char c : Get().save_profile)  // a folder name: letters, digits, space, - and _
         if (std::isalnum(static_cast<unsigned char>(c)) || c == ' ' || c == '-' || c == '_') profile += c;

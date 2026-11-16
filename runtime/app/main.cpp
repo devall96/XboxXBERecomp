@@ -13,6 +13,7 @@
 #include <chrono>
 #include <csignal>
 #include <cwchar>
+#include <cwctype>
 #include <thread>
 
 #include <imgui.h>
@@ -49,7 +50,7 @@ LONG WINAPI WriteCrashDump(EXCEPTION_POINTERS* e) {
         }
         kernel::LogGuestStack(*t->ctx, 256);
     }
-    auto dir = ExeDir() / "CrashDumps";
+    auto dir = DataDir() / "CrashDumps";
     CreateDirectoryW(dir.c_str(), nullptr);
     SYSTEMTIME t;
     GetLocalTime(&t);
@@ -173,6 +174,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 }  // namespace
 
+std::filesystem::path DataDir() {
+    static const std::filesystem::path dir = [] {
+        std::wstring var;
+        for (const wchar_t* c = kGame.name; *c; c++) var += wchar_t(std::towupper(*c));
+        var += L"_DATA_ROOT";
+        const wchar_t* v = _wgetenv(var.c_str());
+        if (v && *v) {
+            std::filesystem::path p(v);
+            std::error_code ec;
+            std::filesystem::create_directories(p, ec);
+            if (p.is_absolute() && std::filesystem::is_directory(p, ec)) return p;
+        }
+        return ExeDir();
+    }();
+    return dir;
+}
+
 std::filesystem::path ExeDir() {
     wchar_t p[MAX_PATH];
     GetModuleFileNameW(nullptr, p, MAX_PATH);
@@ -250,7 +268,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     bool relaunched = std::wcsstr(GetCommandLineW(), L"--relaunched") != nullptr;
     std::string log = app::kGame.log;
     if (app::Instance() > 1) log += "-" + std::to_string(app::Instance());
-    logx::Init((app::ExeDir() / "logs").string(), log, relaunched);
+    logx::Init((app::DataDir() / "logs").string(), log, relaunched);
     app::Load();
     if (app::kGame.init) app::kGame.init();
     if (relaunched && !logx::kVerbose) LOGR("Relaunched: %s", IMAGE_XBE);

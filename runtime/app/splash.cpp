@@ -68,7 +68,7 @@ bool OpenSplash() {
     std::filesystem::path path;
     for (const wchar_t* ext : {L".bmp", L".png"}) {
         std::error_code ec;
-        path = ExeDir() / (std::wstring(kGame.splash) + ext);
+        path = DataDir() / (std::wstring(kGame.splash) + ext);
         if (std::filesystem::exists(path, ec) && Read(path, pixels, w, h)) break;
         pixels.clear();
     }

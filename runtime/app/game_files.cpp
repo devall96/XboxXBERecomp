@@ -30,6 +30,8 @@ namespace fs = std::filesystem;
 
 // assets beside the exe or in any folder above it (the build output)
 fs::path FindAssets() {
+    std::error_code ec0;
+    if (DataDir() != ExeDir() && fs::is_directory(DataDir() / "assets", ec0)) return DataDir() / "assets";
     auto dir = ExeDir();
     std::error_code ec;
     for (int i = 0; i < 6; i++) {
