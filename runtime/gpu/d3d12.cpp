@@ -23,6 +23,7 @@
 #include <mutex>
 #include <optional>
 #include <unordered_map>
+#include <thread>
 #include <unordered_set>
 
 #include <imgui.h>
@@ -757,6 +758,7 @@ private:
     void CapSave(const CapImage& img, const char* name);
     void CapSave(Target& t, const char* name);
     void CapShown(uint32_t bi);
+    void Screenshot(uint32_t bi);
     std::filesystem::path shown_dir_;
     std::unordered_set<uint32_t> cap_vs_;  // vertex programs whose inputs this capture has written  // the last capture's folder, for CapShown after it closed
     // a surface's place in targets_: its key, console size and entry, end when it has none
@@ -3889,6 +3891,7 @@ void D3D12Backend::Present(const Surface& front) {
     uint32_t bi = swap_->GetCurrentBackBufferIndex();
     DrawFrame(t, bi);
     if (shown) CapShown(bi);
+    if (g_screenshot.exchange(false)) Screenshot(bi);
     Submit(false);
     present_fence_[presents_ % (kFrames + 1)].store(fence_value_);
     DeliverReports();
@@ -4166,6 +4169,34 @@ void D3D12Backend::CapSave(const CapImage& img, const char* name) {
     std::vector<uint8_t> px;
     if (!down || !ReadBack(down.Get(), img.w, img.h, px)) return;
     WriteBmp(cap_dir_ / (std::string(name) + ".bmp"), img.w, img.h, px);
+}
+
+// F12: the window's picture, the frame and the UI as shown, to screenshots\<game>_<date>_<time>.png in the data
+// folder
+void D3D12Backend::Screenshot(uint32_t bi) {
+    D3D12_RESOURCE_STATES st = D3D12_RESOURCE_STATE_PRESENT;
+    Transition(bb_[bi].Get(), st, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    std::vector<uint8_t> px;
+    bool ok = ReadBack(bb_[bi].Get(), bb_w_, bb_h_, px);
+    Transition(bb_[bi].Get(), st, D3D12_RESOURCE_STATE_PRESENT);
+    if (!ok) return;
+    for (size_t i = 3; i < px.size(); i += 4) px[i] = 0xFF;
+    std::error_code ec;
+    std::filesystem::path dir = app::DataDir() / "screenshots";
+    std::filesystem::create_directories(dir, ec);
+    SYSTEMTIME tm;
+    GetLocalTime(&tm);
+    wchar_t name[96];
+    swprintf(name, 96, L"%s_%04u%02u%02u_%02u%02u%02u_%03u.png", app::kGame.name, tm.wYear, tm.wMonth, tm.wDay, tm.wHour,
+             tm.wMinute, tm.wSecond, tm.wMilliseconds);
+    std::filesystem::path path = dir / name;
+    std::vector<uint8_t> copy = std::move(px);
+    uint32_t w = bb_w_, h = bb_h_;
+    // encoded off the render thread
+    std::thread([path, copy = std::move(copy), w, h] {
+        texturedumper::WriteBgraPng(path, w, h, copy);
+        LOGI("screenshot: %s", path.string().c_str());
+    }).detach();
 }
 
 // the swap chain's buffer as the window shows it, after the frame and the UI: shown.bmp beside final.bmp

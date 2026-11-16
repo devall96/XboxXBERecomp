@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <filesystem>
 #include <vector>
 
 #include <dxgiformat.h>
@@ -10,6 +11,9 @@
 // image in textures\replacement\ beside the exe with that hash in its name is drawn in its place at any resolution,
 // and textures\dumps\ gets each texture once as a PNG or DDS file to edit or upscale.
 namespace gpu::texturedumper {
+
+// a BGRA picture, rows packed, to a PNG file (screenshots)
+void WriteBgraPng(const std::filesystem::path& path, uint32_t width, uint32_t height, const std::vector<uint8_t>& bgra);
 
 // rows tightly packed, block rows for the BC formats
 struct Level {

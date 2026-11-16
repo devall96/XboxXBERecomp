@@ -395,6 +395,19 @@ void WritePng(const fs::path& path, const Image& img) {
     if (FAILED(hr)) LOGE("texture dump: %s not written (0x%08lx)", Utf8(path).c_str(), static_cast<unsigned long>(hr));
 }
 
+}  // namespace
+
+void WriteBgraPng(const fs::path& path, uint32_t width, uint32_t height, const std::vector<uint8_t>& bgra) {
+    Image img;
+    img.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    img.width = width;
+    img.height = height;
+    img.levels.push_back({bgra, width * 4});
+    WritePng(path, img);
+}
+
+namespace {
+
 bool ReadPng(const fs::path& path, Image& img) {
     IWICImagingFactory* wic = Wic();
     ComPtr<IWICBitmapDecoder> decoder;
