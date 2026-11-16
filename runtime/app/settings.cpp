@@ -62,6 +62,13 @@ void Load() {
     for (uint32_t i = 0; i < 3; i++)
         if (wide == kWide[i]) s.widescreen = Wide(i);
     if (s.widescreen == Wide::Expand && !kGame.expands) s.widescreen = Wide::Console;
+    s.upscaler = std::min(t["upscaler"].value_or(s.upscaler), 1u);
+    s.sharpen = std::min(t["sharpen"].value_or(s.sharpen), 100u);
+    s.grade_exposure = std::clamp(t["grade_exposure"].value_or(s.grade_exposure), -300, 300);
+    s.grade_contrast = std::clamp(t["grade_contrast"].value_or(s.grade_contrast), 50u, 200u);
+    s.grade_saturation = std::min(t["grade_saturation"].value_or(s.grade_saturation), 200u);
+    s.grade_temperature = std::clamp(t["grade_temperature"].value_or(s.grade_temperature), -100, 100);
+    s.grade_tint = std::clamp(t["grade_tint"].value_or(s.grade_tint), -100, 100);
     for (const Option& o : kGame.options) {
         if (o.flag) *o.flag = t[o.key].value_or(*o.flag);
         else *o.value = t[o.key].value_or(*o.value);
@@ -86,7 +93,14 @@ toml::table Table() {
                   {"texture_dump_format", int64_t(s.texture_dump_format)},
                   {"join_ip", s.join_ip},
                   {"audio_output", int64_t(s.audio_output)},
-                  {"widescreen", kWide[uint32_t(s.widescreen)]}};
+                  {"widescreen", kWide[uint32_t(s.widescreen)]},
+                  {"upscaler", int64_t(s.upscaler)},
+                  {"sharpen", int64_t(s.sharpen)},
+                  {"grade_exposure", int64_t(s.grade_exposure)},
+                  {"grade_contrast", int64_t(s.grade_contrast)},
+                  {"grade_saturation", int64_t(s.grade_saturation)},
+                  {"grade_temperature", int64_t(s.grade_temperature)},
+                  {"grade_tint", int64_t(s.grade_tint)}};
     for (const Option& o : kGame.options) {
         if (o.flag) t.insert(o.key, *o.flag);
         else t.insert(o.key, int64_t(*o.value));

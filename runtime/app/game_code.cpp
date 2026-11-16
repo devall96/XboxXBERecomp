@@ -12,6 +12,7 @@
 #include <xinput.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <atomic>
 #include <chrono>
 #include <fstream>
@@ -664,6 +665,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
             g_compiler_bytes = CompilerBytes();
+            // XBE_AUTOSTART: unattended test runs start the game as Start would
+            if (std::getenv("XBE_AUTOSTART")) {
+                CloseWindowWith(hwnd, true);
+                return 0;
+            }
             FlashWindow(hwnd, TRUE);
             return 0;
     }

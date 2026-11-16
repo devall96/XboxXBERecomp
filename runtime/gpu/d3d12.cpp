@@ -40,6 +40,12 @@
 #include "gpu/vertex.h"
 #include "kernel/kernel.h"
 
+// FSR 1's constants on the CPU side (third_party/fsr1, MIT); its shaders are in post/present_shaders.h
+#define A_CPU 1
+#include "../../third_party/fsr1/ffx_a.h"
+#include "../../third_party/fsr1/ffx_fsr1.h"
+#include "gpu/post/present_shaders.h"
+
 using Microsoft::WRL::ComPtr;
 
 namespace gpu {
@@ -570,6 +576,24 @@ private:
     void ExpandPoints(D3D12_GRAPHICS_PIPELINE_STATE_DESC& d, bool sprite);
     float TargetScale() const;  // host pixels per console pixel of the bound target
     void FillWideConstants(DrawConstants& c) const;
+    // the present through FSR 1 and grading (post/present.hlsl): the view to mid_ at the output's size, then mid_ to
+    // the swap chain with RCAS, the gamma ramp and the grade; false leaves it to the plain blit
+    bool PresentPost(Target& t, const float uv[4], const D3D12_VIEWPORT& vp);
+    bool EnsurePresentPipelines();
+    bool EnsureMid(uint32_t w, uint32_t h);
+    uint32_t PresentViews(ID3D12Resource* res, DXGI_FORMAT fmt);
+    bool CaptureDue();
+    bool SkippedByTexture(const State& s);
+    void WriteFrameTime();
+    size_t capture_at_next_ = 0;
+    PerfClock::time_point run_start_ = PerfClock::now();
+    PerfClock::time_point last_present_{};
+    FILE* frame_times_ = nullptr;
+    ComPtr<ID3D12PipelineState> easu_pso_, final_pso_;
+    bool present_failed_ = false;
+    ComPtr<ID3D12Resource> mid_;
+    D3D12_RESOURCE_STATES mid_state_ = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    uint32_t mid_w_ = 0, mid_h_ = 0;
     float wide_ = 1.0f;  // app::WideFactor, read once a frame
     float RenderTargetShift(const State& s, const DrawShaders& sh) const;
     void FillDepthConstants(const State& s, const DrawShaders& sh, const PsoKey& k, DrawConstants& c) const;
@@ -642,7 +666,8 @@ private:
     void CapSave(const CapImage& img, const char* name);
     void CapSave(Target& t, const char* name);
     void CapShown(uint32_t bi);
-    std::filesystem::path shown_dir_;  // the last capture's folder, for CapShown after it closed
+    std::filesystem::path shown_dir_;
+    std::unordered_set<uint32_t> cap_vs_;  // vertex programs whose inputs this capture has written  // the last capture's folder, for CapShown after it closed
     // a surface's place in targets_: its key, console size and entry, end when it has none
     struct TargetSlot {
         uint32_t data;
@@ -910,7 +935,7 @@ void D3D12Backend::CreateBackBufferViews() {
 void D3D12Backend::CreateHeaps() {
     srv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kSrvCount, true, srv_heap_);
     smp_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, kSamplerCount, true, smp_heap_);
-    rtv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kRtvCount + kFrames, false, rtv_heap_);
+    rtv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kRtvCount + kFrames + 1, false, rtv_heap_);
     dsv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_DSV, kDsvCount, false, dsv_heap_);
     CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true, ui_heap_);
     for (uint32_t i = kRtvCount; i-- > 0;) free_rtv_.push_back(i);
@@ -1092,6 +1117,10 @@ void D3D12Backend::ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator 
 // the host texture of a new target, at render scale or the extension's
 bool D3D12Backend::CreateTargetResource(Target& t, const Surface& s) {
     float sc = scale_;
+    if (app::kGame.target_scale) {
+        float want = app::kGame.target_scale(mem::VirtualFromPhysical(s.data), t.gw, t.gh, t.depth, scale_);
+        if (want > 0) sc = want;
+    }
     if (ext_) ext_->MakeTarget(s, t.depth, t.gw, t.gh, sc, t.fmt);
     t.w = std::max(1u, uint32_t(std::lround(t.gw * sc)));
     t.h = std::max(1u, uint32_t(std::lround(t.gh * sc)));
@@ -2509,6 +2538,20 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const 
     binds_.dc = last_dc_gpu_;
 }
 
+// XBE_SKIP_TEX: draws sampling any of these textures (virtual addresses, hex, comma separated) are left out, to see
+// what a pass adds; captures still list them
+bool D3D12Backend::SkippedByTexture(const State& s) {
+    const auto& skip = diag::SkipTextures();
+    if (skip.empty()) return false;
+    for (int i = 0; i < 4; i++) {
+        TextureDesc d;
+        if (!s.textures[size_t(i)] || !Describe(s.textures[size_t(i)], d)) continue;
+        for (uint32_t t : skip)
+            if ((d.data & 0x0FFFFFFF) == (t & 0x0FFFFFFF)) return true;
+    }
+    return false;
+}
+
 void D3D12Backend::CaptureTextures(const State& s, const DrawTextures& stages) {
     for (int i = 0; i < 4; i++) {
         ID3D12Resource* res = stages.res[i];
@@ -2560,9 +2603,10 @@ void D3D12Backend::CaptureDraw(const State& s, uint32_t prim, uint32_t count, co
     CaptureTextures(s, stages);
 }
 
-// small draws: their inputs and constants; then ends the draw's line
+// small draws and each vertex program's first draw: their inputs and constants; then ends the draw's line
 void D3D12Backend::EndDrawCapture(const State& s, const Assembled& a, uint32_t count, const DrawConstants& c) {
-    if (count <= kQuadVertices) CaptureInputs(s, a, c);
+    static const bool all = std::getenv("XBE_CAPTURE_ALL") != nullptr;  // every draw's constants
+    if (all || count <= kQuadVertices || cap_vs_.insert(s.vs_handle).second) CaptureInputs(s, a, c);
     fputc('\n', cap_);
 }
 
@@ -2903,6 +2947,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     SetViewportScissor(s, size.w);
     SetBlendFactorStencilRef(s);
 
+    if (SkippedByTexture(s)) return;
     // geometry, counted while the title runs a visibility test
     uint32_t query = BeginCountedDraw(s);
     DrawGeometry(a);
@@ -3236,6 +3281,7 @@ void D3D12Backend::StartCapture() {
     cap_ = _wfopen((cap_dir_ / "frame.txt").c_str(), L"w");
     cap_i_ = cap_rt_ = 0;
     cap_seen_.clear();
+    cap_vs_.clear();
     cap_sh_.clear();
 }
 
@@ -3276,13 +3322,161 @@ void D3D12Backend::BlitFrame(Target& t) {
     float uv[4] = {0, 0, 1, 1};
     if (app::kGame.view_w && t.gw) uv[2] = std::min(1.0f, float(app::kGame.view_w) / t.gw);
     if (app::kGame.view_h && t.gh) uv[3] = std::min(1.0f, float(app::kGame.view_h) / t.gh);
-    D3D12_VIEWPORT vp{(w - vw) / 2, (h - vh) / 2, vw, vh, 0, 1};
+    // whole pixels: FSR's passes address the view by pixel
+    D3D12_VIEWPORT vp{std::floor((w - vw) / 2), std::floor((h - vh) / 2), std::round(vw), std::round(vh), 0, 1};
+    if (PresentPost(t, uv, vp)) return;
     D3D12_RECT scissor{0, 0, LONG(bb_w_), LONG(bb_h_)};
     cl_->RSSetViewports(1, &vp);
     cl_->RSSetScissorRects(1, &scissor);
     binds_ = {};
     Transition(t.res.Get(), t.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     Blit(t.res.Get(), t.fmt, uv, {.gamma = gamma_});
+}
+
+// XBE_CAPTURE_AT: the next listed time has passed
+bool D3D12Backend::CaptureDue() {
+    const auto& at = diag::CaptureAt();
+    if (capture_at_next_ >= at.size()) return false;
+    double t = std::chrono::duration<double>(PerfClock::now() - run_start_).count();
+    if (t < at[capture_at_next_]) return false;
+    capture_at_next_++;
+    return true;
+}
+
+// XBE_FRAMETIMES: one line per present
+void D3D12Backend::WriteFrameTime() {
+    if (diag::FrameTimesFile().empty()) return;
+    if (!frame_times_) {
+        frame_times_ = _wfopen(diag::FrameTimesFile().c_str(), L"w");
+        if (!frame_times_) return;
+        fputs("present,time_ms,interval_ms\n", frame_times_);
+        last_present_ = PerfClock::now();
+    }
+    auto now = PerfClock::now();
+    double t = std::chrono::duration<double, std::milli>(now - run_start_).count();
+    double dt = std::chrono::duration<double, std::milli>(now - last_present_).count();
+    last_present_ = now;
+    fprintf(frame_times_, "%llu,%.3f,%.3f\n", (unsigned long long)presents_, t, dt);
+    constexpr uint64_t kFlushEvery = 60;
+    if (presents_ % kFlushEvery == 0) fflush(frame_times_);
+}
+
+bool D3D12Backend::EnsurePresentPipelines() {
+    if (easu_pso_) return true;
+    if (present_failed_) return false;
+    present_failed_ = true;
+    auto blob = [](const BYTE* p, size_t n) {
+        ComPtr<ID3DBlob> b;
+        if (SUCCEEDED(D3DCreateBlob(n, &b))) std::memcpy(b->GetBufferPointer(), p, n);
+        return b;
+    };
+    ComPtr<ID3DBlob> vs = blob(kPresentVs, sizeof(kPresentVs));
+    ComPtr<ID3DBlob> easu = blob(kPresentEasu, sizeof(kPresentEasu));
+    ComPtr<ID3DBlob> fin = blob(kPresentFinal, sizeof(kPresentFinal));
+    if (!vs || !easu || !fin) return false;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC d = FullScreenPipelineDesc(vs.Get(), easu.Get(), kBgra);
+    if (FAILED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&easu_pso_)))) {
+        LOGE("d3d12: FSR 1 EASU pipeline failed");
+        return false;
+    }
+    d = FullScreenPipelineDesc(vs.Get(), fin.Get(), kBgra);
+    if (FAILED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&final_pso_)))) {
+        LOGE("d3d12: present pipeline failed");
+        easu_pso_.Reset();
+        return false;
+    }
+    present_failed_ = false;
+    return true;
+}
+
+// mid_: the view at the output's size, its view the RTV heap's last slot
+bool D3D12Backend::EnsureMid(uint32_t w, uint32_t h) {
+    if (mid_ && mid_w_ == w && mid_h_ == h) return true;
+    if (mid_) CurrentFrame().garbage.push_back(mid_);
+    mid_.Reset();
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC td = Texture2DDesc(kBgra, w, h);
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    D3D12_CLEAR_VALUE cv{};
+    cv.Format = kBgra;
+    mid_state_ = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, mid_state_, &cv, IID_PPV_ARGS(&mid_))))
+        return false;
+    dev_->CreateRenderTargetView(mid_.Get(), nullptr, Cpu(rtv_heap_.Get(), kRtvCount + kFrames, rtv_inc_));
+    mid_w_ = w;
+    mid_h_ = h;
+    return true;
+}
+
+// a view of res for the present's passes, with the gamma ramp beside it: the first of two slots
+uint32_t D3D12Backend::PresentViews(ID3D12Resource* res, DXGI_FORMAT fmt) {
+    uint32_t slot = AllocSrvSlots(2);
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+    sv.Format = fmt;
+    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sv.Texture2D.MipLevels = 1;
+    dev_->CreateShaderResourceView(res, &sv, Cpu(srv_heap_.Get(), slot, srv_inc_));
+    sv.Format = kBgra;
+    dev_->CreateShaderResourceView(lut_.Get(), &sv, Cpu(srv_heap_.Get(), slot + 1, srv_inc_));
+    return slot;
+}
+
+bool D3D12Backend::PresentPost(Target& t, const float uv[4], const D3D12_VIEWPORT& vp) {
+    const app::Settings& st = app::Get();
+    bool grade = st.grade_exposure || st.grade_contrast != 100 || st.grade_saturation != 100 ||
+                 st.grade_temperature || st.grade_tint;
+    // the view's size in the target's host pixels
+    float sw = t.w * uv[2], sh = t.h * uv[3];
+    uint32_t dw = uint32_t(vp.Width), dh = uint32_t(vp.Height);
+    bool upscale = st.upscaler == 1 && sw < dw && sh < dh;
+    if (!upscale && !st.sharpen && !grade) return false;
+    if (!dw || !dh || !EnsurePresentPipelines() || !EnsureMid(dw, dh)) return false;
+    D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv = Cpu(rtv_heap_.Get(), kRtvCount + swap_->GetCurrentBackBufferIndex(), rtv_inc_);
+
+    // the view to mid_: EASU upscaling, else the plain filter (a box of taps where it shrinks)
+    Transition(mid_.Get(), mid_state_, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    SetBlitTarget(Cpu(rtv_heap_.Get(), kRtvCount + kFrames, rtv_inc_), dw, dh);
+    Transition(t.res.Get(), t.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    if (upscale) {
+        uint32_t slot = PresentViews(t.res.Get(), t.fmt);
+        AU1 con[16] = {};
+        FsrEasuCon(con, con + 4, con + 8, con + 12, sw, sh, float(t.w), float(t.h), float(dw), float(dh));
+        Alloc cb = Upload(256, 256);
+        std::memcpy(cb.cpu, con, sizeof(con));
+        DrawFullScreen(easu_pso_.Get(), cb.gpu, slot);
+    } else {
+        uint32_t taps = uint32_t(std::clamp(std::ceil(std::max(sw / dw, sh / dh)), 1.0f, 4.0f));
+        Blit(t.res.Get(), t.fmt, uv, {.taps = taps});
+    }
+    Transition(mid_.Get(), mid_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+    // mid_ to the swap chain: RCAS, the gamma ramp, the grade
+    cl_->OMSetRenderTargets(1, &bb_rtv, FALSE, nullptr);
+    D3D12_RECT scissor{0, 0, LONG(bb_w_), LONG(bb_h_)};
+    cl_->RSSetViewports(1, &vp);
+    cl_->RSSetScissorRects(1, &scissor);
+    uint32_t slot = PresentViews(mid_.Get(), kBgra);
+    struct {
+        AU1 con[16];
+        float opts[4], grade0[4], grade1[4];
+    } p{};
+    constexpr float kSharpenStops = 2.0f;  // sharpen 1 is RCAS at 2 stops, 100 at 0 (its sharpest)
+    FsrRcasCon(p.con, kSharpenStops * (1.0f - st.sharpen / 100.0f));
+    p.opts[0] = st.sharpen ? 1.0f : 0.0f;
+    p.opts[1] = gamma_ ? 1.0f : 0.0f;
+    p.opts[2] = vp.TopLeftX;
+    p.opts[3] = vp.TopLeftY;
+    p.grade0[0] = st.grade_exposure / 100.0f;
+    p.grade0[1] = st.grade_contrast / 100.0f;
+    p.grade0[2] = st.grade_saturation / 100.0f;
+    p.grade0[3] = grade ? 1.0f : 0.0f;
+    p.grade1[0] = st.grade_temperature / 100.0f;
+    p.grade1[1] = st.grade_tint / 100.0f;
+    Alloc cb = Upload(256, 256);
+    std::memcpy(cb.cpu, &p, sizeof(p));
+    DrawFullScreen(final_pso_.Get(), cb.gpu, slot);
+    return true;
 }
 
 void D3D12Backend::RenderUi() {
@@ -3394,7 +3588,7 @@ void D3D12Backend::Present(const Surface& front) {
     if (cap_) {
         FinishCapture(front);
         shown = true;
-    } else if (g_capture.exchange(false) && CaptureOn()) {
+    } else if ((g_capture.exchange(false) || CaptureDue()) && CaptureOn()) {
         StartCapture();
     }
     ResizeSwap();
@@ -3417,6 +3611,7 @@ void D3D12Backend::Present(const Surface& front) {
 
     presents_++;
     presents_seen_.store(presents_);
+    WriteFrameTime();
     frame_++;
     ReleaseOldTextures();
     ResetFrame();

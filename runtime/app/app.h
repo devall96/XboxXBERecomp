@@ -34,6 +34,13 @@ struct Settings {
     uint32_t texture_dump_format = 0;  // 0 PNG, 1 DDS
     uint32_t audio_output = 0;         // audio::kOutputAuto, Stereo, Surround or Mono
     Wide widescreen = Wide::Console;   // Expand where the game has it (Load picks it for a new settings file)
+    uint32_t upscaler = 1;             // 0 bilinear, 1 AMD FSR 1 (EASU) when the view renders smaller than it shows
+    uint32_t sharpen = 0;              // 0 off, to 100: FSR 1's RCAS, 2 stops (100 the sharpest)
+    // colour grading of the presented picture: exposure in hundredths of a stop, contrast and saturation in percent,
+    // temperature and tint -100 to 100
+    int32_t grade_exposure = 0;
+    uint32_t grade_contrast = 100, grade_saturation = 100;
+    int32_t grade_temperature = 0, grade_tint = 0;
     std::string join_ip;                   // co-op: a host past the LAN the system link search also asks
 };
 
@@ -123,6 +130,9 @@ struct GameInfo {
     uint32_t view_w = 0, view_h = 0;
     // the game widens its own 3D view by WideFactor() (a hook on its projection), which allows Wide::Expand
     bool expands = false;
+    // a render target's host pixels per console pixel in place of the render scale (a shadow map drawn finer), 0 for
+    // the render scale; data is the surface's virtual address, a depth target shares its colour target's size
+    float (*target_scale)(uint32_t data, uint32_t gw, uint32_t gh, bool depth, float render_scale) = nullptr;
 };
 extern const GameInfo kGame;
 
