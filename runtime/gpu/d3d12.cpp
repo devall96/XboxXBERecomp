@@ -20,6 +20,7 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <optional>
 #include <unordered_map>
@@ -672,6 +673,11 @@ private:
     bool EnsurePresentPipelines();
     bool EnsureMid(uint32_t w, uint32_t h);
     uint32_t PresentViews(ID3D12Resource* res, DXGI_FORMAT fmt);
+    bool EnsureColourLut();
+    ComPtr<ID3D12Resource> clut_;
+    D3D12_RESOURCE_STATES clut_state_ = D3D12_RESOURCE_STATE_COMMON;
+    uint32_t clut_n_ = 0;
+    std::string clut_name_;
     bool CaptureDue();
     void PresentSwap();
     PerfClock::time_point last_swap_{};
@@ -3696,8 +3702,74 @@ bool D3D12Backend::EnsureMid(uint32_t w, uint32_t h) {
 }
 
 // a view of res for the present's passes, with the gamma ramp beside it: the first of two slots
+// colour_lut: the .cube file's table as a 3D texture, loaded again when the setting names another; false without one
+bool D3D12Backend::EnsureColourLut() {
+    const std::string& name = app::Get().colour_lut;
+    if (name == clut_name_) return clut_ != nullptr;
+    clut_name_ = name;
+    clut_.Reset();
+    clut_n_ = 0;
+    if (name.empty()) return false;
+    std::filesystem::path path = app::DataDir() / "luts" / std::filesystem::u8path(name);
+    std::ifstream f(path);
+    if (!f) {
+        LOGW("colour LUT %s not found", path.string().c_str());
+        return false;
+    }
+    // .cube: LUT_3D_SIZE n, then n^3 lines of r g b, red fastest; other keywords and # comments skipped
+    constexpr uint32_t kMaxSize = 128;
+    uint32_t n = 0;
+    std::vector<float> rgba;
+    for (std::string line; std::getline(f, line);) {
+        if (line.empty() || line[0] == '#') continue;
+        if (line.rfind("LUT_3D_SIZE", 0) == 0) {
+            n = uint32_t(std::atoi(line.c_str() + 11));
+            if (n < 2 || n > kMaxSize) return false;
+            rgba.reserve(size_t(n) * n * n * 4);
+            continue;
+        }
+        float r, g, b;
+        if (n && std::sscanf(line.c_str(), "%f %f %f", &r, &g, &b) == 3) {
+            rgba.insert(rgba.end(), {r, g, b, 1.0f});
+        }
+    }
+    if (!n || rgba.size() != size_t(n) * n * n * 4) {
+        LOGW("colour LUT %s: not a 3D .cube table", path.string().c_str());
+        return false;
+    }
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC td{};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    td.Width = n;
+    td.Height = n;
+    td.DepthOrArraySize = UINT16(n);
+    td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    td.SampleDesc.Count = 1;
+    clut_state_ = D3D12_RESOURCE_STATE_COPY_DEST;
+    if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, clut_state_, nullptr,
+                                             IID_PPV_ARGS(&clut_)))) {
+        return false;
+    }
+    uint32_t row = n * 16;
+    uint32_t pitch = (row + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+    Alloc a = Upload(uint64_t(pitch) * n * n, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+    for (uint32_t z = 0; z < n; z++)
+        for (uint32_t y = 0; y < n; y++)
+            std::memcpy(a.cpu + (size_t(z) * n + y) * pitch, &rgba[(size_t(z) * n + y) * n * 4], row);
+    D3D12_TEXTURE_COPY_LOCATION dl{clut_.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+    D3D12_TEXTURE_COPY_LOCATION sl{a.res, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+    sl.PlacedFootprint.Offset = a.off;
+    sl.PlacedFootprint.Footprint = {DXGI_FORMAT_R32G32B32A32_FLOAT, n, n, n, pitch};
+    cl_->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr);
+    Transition(clut_.Get(), clut_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    clut_n_ = n;
+    LOGI("colour LUT %s, %u^3", path.string().c_str(), n);
+    return true;
+}
+
 uint32_t D3D12Backend::PresentViews(ID3D12Resource* res, DXGI_FORMAT fmt) {
-    uint32_t slot = AllocSrvSlots(2);
+    uint32_t slot = AllocSrvSlots(3);
     D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
     sv.Format = fmt;
     sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -3706,6 +3778,13 @@ uint32_t D3D12Backend::PresentViews(ID3D12Resource* res, DXGI_FORMAT fmt) {
     dev_->CreateShaderResourceView(res, &sv, Cpu(srv_heap_.Get(), slot, srv_inc_));
     sv.Format = kBgra;
     dev_->CreateShaderResourceView(lut_.Get(), &sv, Cpu(srv_heap_.Get(), slot + 1, srv_inc_));
+    // t2: the colour LUT, or a null 3D view
+    D3D12_SHADER_RESOURCE_VIEW_DESC cv{};
+    cv.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    cv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+    cv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    cv.Texture3D.MipLevels = 1;
+    dev_->CreateShaderResourceView(clut_n_ ? clut_.Get() : nullptr, &cv, Cpu(srv_heap_.Get(), slot + 2, srv_inc_));
     return slot;
 }
 
@@ -3718,7 +3797,8 @@ bool D3D12Backend::PresentPost(Target& t, const float uv[4], const D3D12_VIEWPOR
     uint32_t dw = uint32_t(vp.Width), dh = uint32_t(vp.Height);
     bool upscale = st.upscaler == 1 && sw < dw && sh < dh;
     bool filter = st.colour_filter != 0 && st.colour_filter_strength != 0;
-    if (!upscale && !st.sharpen && !grade && !filter) return false;
+    bool clut = EnsureColourLut();
+    if (!upscale && !st.sharpen && !grade && !filter && !clut) return false;
     if (!dw || !dh || !EnsurePresentPipelines() || !EnsureMid(dw, dh)) return false;
     D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv = Cpu(rtv_heap_.Get(), kRtvCount + swap_->GetCurrentBackBufferIndex(), rtv_inc_);
 
@@ -3763,6 +3843,8 @@ bool D3D12Backend::PresentPost(Target& t, const float uv[4], const D3D12_VIEWPOR
     p.grade1[1] = st.grade_tint / 100.0f;
     p.filter[0] = filter ? float(st.colour_filter) : 0.0f;
     p.filter[1] = st.colour_filter_strength / 100.0f;
+    p.filter[2] = clut ? 1.0f : 0.0f;
+    p.filter[3] = float(clut_n_);
     Alloc cb = Upload(256, 256);
     std::memcpy(cb.cpu, &p, sizeof(p));
     DrawFullScreen(final_pso_.Get(), cb.gpu, slot);

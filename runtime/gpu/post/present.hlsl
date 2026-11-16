@@ -20,8 +20,10 @@ cbuffer P : register(b1) {
     float4 opts;   // final: x sharpen, y gamma ramp, zw the viewport's top left in the target
     float4 grade0; // exposure (stops), contrast, saturation, 1 to grade
     float4 grade1; // temperature, tint (-1 to 1)
-    float4 filter; // x colour vision filter: 0 none, 1 protanopia, 2 deuteranopia, 3 tritanopia; y strength
+    float4 filter; // x colour vision filter: 0 none, 1 protanopia, 2 deuteranopia, 3 tritanopia; y strength;
+                   // z 1 with a colour LUT, w its size
 };
+Texture3D clut : register(t2);  // colour_lut: a .cube file's table
 
 float4 vs(uint id : SV_VertexID) : SV_Position {
     float2 t = float2((id << 1) & 2, id & 2);
@@ -76,6 +78,11 @@ float4 ps_final(float4 pos : SV_Position) : SV_Target {
     else c = img.Load(int3(p, 0)).rgb;
     if (opts.y > 0) c = float3(lut.Sample(ps, float2(c.r, 0.5)).r, lut.Sample(ps, float2(c.g, 0.5)).g, lut.Sample(ps, float2(c.b, 0.5)).b);
     if (grade0.w > 0) c = Grade(c);
+    if (filter.z > 0) {
+        // the table's cell centres: 0 and 1 land on its first and last entries
+        float n = filter.w;
+        c = clut.SampleLevel(ls, saturate(c) * ((n - 1) / n) + 0.5 / n, 0).rgb;
+    }
     if (filter.x > 0) c = Daltonize(c, int(filter.x));
     return float4(c, 1);
 }

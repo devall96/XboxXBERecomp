@@ -76,6 +76,7 @@ void Load() {
     s.hud_visible = t["hud_visible"].value_or(s.hud_visible);
     s.colour_filter = std::min(t["colour_filter"].value_or(s.colour_filter), 3u);
     s.colour_filter_strength = std::min(t["colour_filter_strength"].value_or(s.colour_filter_strength), 200u);
+    s.colour_lut = t["colour_lut"].value_or(s.colour_lut);
     s.sharpen = std::min(t["sharpen"].value_or(s.sharpen), 100u);
     s.grade_exposure = std::clamp(t["grade_exposure"].value_or(s.grade_exposure), -300, 300);
     s.grade_contrast = std::clamp(t["grade_contrast"].value_or(s.grade_contrast), 50u, 200u);
@@ -116,6 +117,7 @@ toml::table Table() {
                   {"hud_visible", s.hud_visible},
                   {"colour_filter", int64_t(s.colour_filter)},
                   {"colour_filter_strength", int64_t(s.colour_filter_strength)},
+                  {"colour_lut", s.colour_lut},
                   {"sharpen", int64_t(s.sharpen)},
                   {"grade_exposure", int64_t(s.grade_exposure)},
                   {"grade_contrast", int64_t(s.grade_contrast)},
