@@ -114,6 +114,82 @@ struct PerfScope {
     }
 };
 
+// Compiled shaders kept across runs: cache\shaders.bin beside the exe, one record per shader (its source hash, size,
+// bytecode) appended as each is first compiled, all read at the first lookup. A shader compiles once per PC instead
+// of once per run, which takes the compile hitches out of every later start. kShaderCacheVersion changes with the
+// compile flags or the translation's output format; a file of another version starts over.
+constexpr uint32_t kShaderCacheMagic = 0x43534855;  // "UHSC"
+constexpr uint32_t kShaderCacheVersion = 1;
+class ShaderDiskCache {
+public:
+    const std::vector<uint8_t>* Find(uint64_t hash) {
+        Open();
+        auto it = blobs_.find(hash);
+        return it == blobs_.end() ? nullptr : &it->second;
+    }
+    void Add(uint64_t hash, const void* data, size_t size) {
+        Open();
+        if (!file_ || blobs_.count(hash)) return;
+        uint32_t n = uint32_t(size);
+        fwrite(&hash, 8, 1, file_);
+        fwrite(&n, 4, 1, file_);
+        fwrite(data, 1, n, file_);
+        fflush(file_);
+        blobs_[hash].assign(static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + n);
+    }
+
+private:
+    void Open() {
+        if (opened_) return;
+        opened_ = true;
+        std::error_code ec;
+        std::filesystem::path dir = app::ExeDir() / "cache";
+        std::filesystem::create_directories(dir, ec);
+        std::filesystem::path path = dir / (app::Instance() > 1 ? "shaders" + std::to_string(app::Instance()) + ".bin"
+                                                               : std::string("shaders.bin"));
+        bool fresh = true;
+        if (FILE* f = _wfopen(path.c_str(), L"rb")) {
+            uint32_t head[2] = {};
+            if (fread(head, 4, 2, f) == 2 && head[0] == kShaderCacheMagic && head[1] == kShaderCacheVersion) {
+                fresh = false;
+                uint64_t hash;
+                uint32_t n;
+                constexpr uint32_t kMaxShader = 1u << 20;
+                while (fread(&hash, 8, 1, f) == 1 && fread(&n, 4, 1, f) == 1 && n <= kMaxShader) {
+                    std::vector<uint8_t> b(n);
+                    if (fread(b.data(), 1, n, f) != n) break;  // a record cut short by a crash: the rest is lost
+                    blobs_[hash] = std::move(b);
+                }
+            }
+            fclose(f);
+        }
+        if (fresh) {
+            file_ = _wfopen(path.c_str(), L"wb");
+            uint32_t head[2] = {kShaderCacheMagic, kShaderCacheVersion};
+            if (file_) fwrite(head, 4, 2, file_);
+        } else {
+            // a cut short tail is rewritten whole, so appends land after the last good record
+            file_ = _wfopen(path.c_str(), L"wb");
+            if (file_) {
+                uint32_t head[2] = {kShaderCacheMagic, kShaderCacheVersion};
+                fwrite(head, 4, 2, file_);
+                for (auto& [h, b] : blobs_) {
+                    uint32_t n = uint32_t(b.size());
+                    fwrite(&h, 8, 1, file_);
+                    fwrite(&n, 4, 1, file_);
+                    fwrite(b.data(), 1, n, file_);
+                }
+                fflush(file_);
+            }
+        }
+        LOGI("d3d12: shader cache %s, %zu shaders", path.string().c_str(), blobs_.size());
+    }
+    bool opened_ = false;
+    FILE* file_ = nullptr;
+    std::unordered_map<uint64_t, std::vector<uint8_t>> blobs_;
+};
+ShaderDiskCache g_shader_disk;
+
 // F3 captures only with diag::CaptureDir set
 bool CaptureOn() {
     if (diag::CaptureDir().empty()) LOG_FIRST(1, "capture: set XBE_CAPTURE_DIR");
@@ -1468,6 +1544,13 @@ ID3DBlob* D3D12Backend::Compile(const std::string& src, const char* entry, const
     if (it != blobs_.end()) return it->second.Get();
     ComPtr<ID3DBlob> code;
     ComPtr<ID3DBlob> err;
+    if (const std::vector<uint8_t>* saved = g_shader_disk.Find(hash)) {
+        if (SUCCEEDED(D3DCreateBlob(saved->size(), &code))) {
+            std::memcpy(code->GetBufferPointer(), saved->data(), saved->size());
+            blobs_[hash] = code;
+            return code.Get();
+        }
+    }
     PerfScope perf_compile{g_perf.compile};
     g_perf.shaders++;
     HRESULT hr = D3DCompile(src.data(), src.size(), nullptr, nullptr, nullptr, entry, profile,
@@ -1479,6 +1562,7 @@ ID3DBlob* D3D12Backend::Compile(const std::string& src, const char* entry, const
         return nullptr;
     }
     blobs_[hash] = code;
+    g_shader_disk.Add(hash, code->GetBufferPointer(), code->GetBufferSize());
     return code.Get();
 }
 
