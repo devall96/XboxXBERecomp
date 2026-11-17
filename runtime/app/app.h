@@ -193,9 +193,9 @@ struct GameInfo {
     bool (*launcher)() = nullptr;
     const wchar_t* release_name = nullptr;
     // a texture's picture edited by the game (button prompts for the device in use): texture_edits says which
-    // texture names (the texture pack's keys) it edits; texture_image, on a worker thread, gets level 0 as BGRA rows
-    // packed and may change its size; false draws the console's picture
-    bool (*texture_edits)(uint64_t key) = nullptr;
+    // textures (the texture pack's keys, with their size) it may edit; texture_image, on a worker thread, gets level 0
+    // as BGRA rows packed and may change its size; false draws the console's picture
+    bool (*texture_edits)(uint64_t key, uint32_t w, uint32_t h) = nullptr;
     bool (*texture_image)(uint64_t key, uint32_t& w, uint32_t& h, std::vector<uint8_t>& bgra) = nullptr;
 };
 extern const GameInfo kGame;

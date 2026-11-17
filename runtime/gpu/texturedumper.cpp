@@ -764,7 +764,7 @@ bool Update() {
 
 bool Edit(uint64_t key, const TextureDesc& d, const uint8_t* guest, const uint32_t* palette, bool ui) {
     const app::GameInfo& gi = app::kGame;
-    bool game = key && gi.texture_edits && gi.texture_image && gi.texture_edits(key);
+    bool game = key && gi.texture_edits && gi.texture_image && gi.texture_edits(key, d.width, d.height);
     constexpr uint32_t kMaxUiSide = 512;  // 2D art past this is a picture, not a font or a frame
     ui = ui && key && g.set.ui_upscale && d.width <= kMaxUiSide && d.height <= kMaxUiSide;
     if (!game && !ui) return false;
