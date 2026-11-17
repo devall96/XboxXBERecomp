@@ -130,7 +130,7 @@ void UiNewFrame() {
 #ifdef _WIN32
     ImGui_ImplWin32_NewFrame();
 #else
-    UiNewFrame();
+    ImGui_ImplSDL3_NewFrame();  // the display size and input: without it ImGui has a 0x0 screen and draws nothing
 #endif
 }
 
