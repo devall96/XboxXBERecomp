@@ -4368,7 +4368,7 @@ void WriteBmp(const std::filesystem::path& path, uint32_t w, uint32_t h, const s
 }
 
 void VulkanBackend::CapSave(Image& img, uint32_t w, uint32_t h, float mul, const char* name) {
-    if (img.depth) return;  // a depth image's grey picture needs the depth blit, d3d12.cpp's kDepthRead view
+    // a depth image is sampled through its depth view: depth in red, as d3d12.cpp's kDepthRead view gives it
     ImageRef down = Shrink(img, w, h, {.mul = mul});
     std::vector<uint8_t> px;
     if (!down || !ReadBack(*down, w, h, px)) return;
@@ -4414,6 +4414,12 @@ void VulkanBackend::CapStep(const Surface& rt) {
         char name[32];
         snprintf(name, sizeof(name), "%04u_%08X", cap_i_, cap_rt_);
         CapSave(it->second, name);
+    }
+    auto z = targets_.find(TargetMapKey(cap_rt_, true));
+    if (cap_rt_ && z != targets_.end()) {
+        char name[32];
+        snprintf(name, sizeof(name), "%04u_%08X_z", cap_i_, cap_rt_);
+        CapSave(z->second, name);
     }
     cap_rt_ = d;
 }
