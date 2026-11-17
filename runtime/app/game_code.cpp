@@ -610,8 +610,14 @@ public:
 
     bool Cancel() {
         std::lock_guard lock(m_);
-        for (pid_t p : running_)
-            if (!done_.count(p)) kill(p, SIGKILL);
+        // killed and reaped here, so none is left a zombie; the waits find them in done_ before calling waitpid
+        for (pid_t p : running_) {
+            if (done_.count(p)) continue;
+            kill(p, SIGKILL);
+            int status = 0;
+            waitpid(p, &status, 0);
+            done_[p] = 128 + SIGKILL;
+        }
         return false;
     }
 

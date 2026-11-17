@@ -87,7 +87,8 @@ void Load() {
     s.colour_filter_strength = std::min(t["colour_filter_strength"].value_or(s.colour_filter_strength), 200u);
     s.colour_lut = t["colour_lut"].value_or(s.colour_lut);
     s.sharpen = std::min(t["sharpen"].value_or(s.sharpen), 100u);
-    s.hdr = t["hdr"].value_or(s.hdr);
+    // HDR is set aside for now (no version offers it): an older file's hdr = true is read as off, and written so
+    s.hdr = false;
     s.hdr_paper_white = std::clamp(t["hdr_paper_white"].value_or(s.hdr_paper_white), 80u, 500u);
     s.hdr_peak = std::min(t["hdr_peak"].value_or(s.hdr_peak), 10000u);
     s.hdr_highlights = std::min(t["hdr_highlights"].value_or(s.hdr_highlights), 100u);

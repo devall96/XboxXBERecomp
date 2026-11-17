@@ -4,6 +4,7 @@
 #include <cwchar>
 #include <memory>
 #include <thread>
+#include <vector>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -13,6 +14,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <shellapi.h>
 #else
 #include <SDL3/SDL_messagebox.h>
 #include <pthread.h>
@@ -212,13 +214,42 @@ std::wstring Env(const wchar_t* name) {
 
 #endif
 
+namespace {
+// the arguments after the program's own path, whole: "--configure" in a folder's name is not the argument
+std::vector<std::wstring> ArgWords() {
+    std::vector<std::wstring> words;
+#ifdef _WIN32
+    int n = 0;
+    if (wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &n)) {
+        for (int i = 1; i < n; i++) words.emplace_back(argv[i]);
+        LocalFree(argv);
+    }
+#else
+    const std::vector<std::string>& args = Args();
+    for (size_t i = 1; i < args.size(); i++) words.push_back(Wide(args[i]));
+#endif
+    return words;
+}
+}  // namespace
+
+// "--name 3", "--name=3" or "--name3"
 int ArgInt(const wchar_t* name, int def) {
-    std::wstring line = CommandLine();
-    size_t p = line.find(name);
-    if (p == std::wstring::npos) return def;
-    return int(std::wcstol(line.c_str() + p + std::wcslen(name), nullptr, 10));
+    std::vector<std::wstring> words = ArgWords();
+    size_t len = std::wcslen(name);
+    for (size_t i = 0; i < words.size(); i++) {
+        if (words[i].compare(0, len, name) != 0) continue;
+        std::wstring rest = words[i].substr(len);
+        if (!rest.empty() && rest[0] == L'=') rest.erase(0, 1);
+        if (rest.empty() && i + 1 < words.size()) rest = words[i + 1];
+        return rest.empty() ? def : int(std::wcstol(rest.c_str(), nullptr, 10));
+    }
+    return def;
 }
 
-bool HasArg(const wchar_t* name) { return CommandLine().find(name) != std::wstring::npos; }
+bool HasArg(const wchar_t* name) {
+    for (const std::wstring& w : ArgWords())
+        if (w == name) return true;
+    return false;
+}
 
 }  // namespace platform

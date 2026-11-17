@@ -927,6 +927,7 @@ private:
     VkSwapchainKHR swap_ = VK_NULL_HANDLE;
     VkFormat swap_fmt_ = kBgra;
     VkPresentModeKHR swap_mode_ = VK_PRESENT_MODE_FIFO_KHR;
+    std::vector<VkPresentModeKHR> present_modes_;  // the surface's, read with each swap chain
     std::vector<ImageRef> bb_;
     uint32_t present_image_ = 0;  // the acquired swap chain image
     bool swap_lost_ = false;      // out of date or minimised: made again at the next present
@@ -1043,10 +1044,24 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
     g_reversed_depth = true;
     guest_w_ = width;
     guest_h_ = height;
-    if (!CreateInstance() || !CreateDevice()) return false;
-    if (!CreateLayout()) return false;
+    // a failure here lets go of the window's surface, which D3D12 (the fallback) needs to itself; the rest is freed
+    // at exit. Every step that can fail comes before the pipeline workers start.
+    auto fail = [&] {
+        if (swap_) vkDestroySwapchainKHR(dev_, swap_, nullptr);
+        swap_ = VK_NULL_HANDLE;
+        if (surface_) vkDestroySurfaceKHR(instance_, surface_, nullptr);
+        surface_ = VK_NULL_HANDLE;
+        return false;
+    };
+    if (!CreateInstance() || !CreateDevice()) return fail();
+    if (!CreateLayout()) return fail();
     CreateFrames();
-    if (!CreateSwapchain()) return false;
+    if (!CreateSwapchain()) {
+        int pw = 0, ph = 0;
+        WindowPixels(pw, ph);
+        LOGE("vulkan: no swap chain for the %dx%d window%s", pw, ph, pw && ph ? "" : " (minimised)");
+        return fail();
+    }
     CreateDummies();
     lut_ = MakeImage(kBgra, 256, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
     StartPipelineWorkers();
@@ -1097,12 +1112,29 @@ bool VulkanBackend::CreateDevice() {
     vkEnumeratePhysicalDevices(instance_, &n, nullptr);
     std::vector<VkPhysicalDevice> devs(n);
     vkEnumeratePhysicalDevices(instance_, &n, devs.data());
-    // a discrete GPU first, as on hybrid laptops; Vulkan 1.3 with a queue that draws and presents
+    // a discrete GPU first, as on hybrid laptops; Vulkan 1.3 with a queue that draws and presents to this window (a
+    // discrete GPU that cannot present, as on some laptops, leaves it to the one that can)
+    auto presents = [&](VkPhysicalDevice d) {
+        uint32_t qn = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(d, &qn, nullptr);
+        std::vector<VkQueueFamilyProperties> qf(qn);
+        vkGetPhysicalDeviceQueueFamilyProperties(d, &qn, qf.data());
+        for (uint32_t i = 0; i < qn; i++) {
+            VkBool32 present = VK_FALSE;
+            vkGetPhysicalDeviceSurfaceSupportKHR(d, i, surface_, &present);
+            if ((qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) && present) return true;
+        }
+        return false;
+    };
     int best = -1, best_rank = -1;
     for (int i = 0; i < int(n); i++) {
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(devs[size_t(i)], &p);
         if (p.apiVersion < VK_API_VERSION_1_3) continue;
+        if (!presents(devs[size_t(i)])) {
+            LOGW("vulkan: %s cannot draw to the window, passed over", p.deviceName);
+            continue;
+        }
         int rank = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 2 : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 1 : 0;
         if (rank > best_rank) best = i, best_rank = rank;
     }
@@ -1236,6 +1268,7 @@ bool VulkanBackend::CreateSwapchain() {
     vkGetPhysicalDeviceSurfacePresentModesKHR(phys_, surface_, &n, nullptr);
     std::vector<VkPresentModeKHR> modes(n);
     vkGetPhysicalDeviceSurfacePresentModesKHR(phys_, surface_, &n, modes.data());
+    present_modes_ = modes;
     swap_mode_ = WantedMode(modes);
     VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     ci.surface = surface_;
@@ -3691,12 +3724,8 @@ void VulkanBackend::Copy(const Surface& src, const Surface& dst, uint32_t count,
 void VulkanBackend::ResizeSwap() {
     int pw = 0, ph = 0;
     WindowPixels(pw, ph);
-    uint32_t n = 0;
-    vkGetPhysicalDeviceSurfacePresentModesKHR(phys_, surface_, &n, nullptr);
-    std::vector<VkPresentModeKHR> modes(n);
-    vkGetPhysicalDeviceSurfacePresentModesKHR(phys_, surface_, &n, modes.data());
     bool resized = pw > 0 && ph > 0 && (uint32_t(pw) != bb_w_ || uint32_t(ph) != bb_h_);
-    if (!resized && !swap_lost_ && WantedMode(modes) == swap_mode_) return;
+    if (!resized && !swap_lost_ && WantedMode(present_modes_) == swap_mode_) return;
     Flush();
     swap_lost_ = !CreateSwapchain();
 }

@@ -14,8 +14,8 @@ struct Pad;
 namespace app {
 
 enum class DisplayMode : uint32_t { Fullscreen, Borderless, Windowed };
-inline constexpr uint32_t kFpsCapRefresh = 1;
-inline constexpr uint32_t kRendererD3D12 = 0, kRendererVulkan = 1;  // fps_cap: the monitor's refresh rate
+inline constexpr uint32_t kFpsCapRefresh = 1;  // fps_cap: the monitor's refresh rate
+inline constexpr uint32_t kRendererD3D12 = 0, kRendererVulkan = 1;
 // vsync_mode: how frames meet the display
 enum class VSync : uint32_t {
     Off,       // present at once, tearing where the display allows it (lowest latency)

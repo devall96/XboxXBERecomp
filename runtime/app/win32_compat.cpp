@@ -1,6 +1,7 @@
 #ifndef _WIN32
 #include "app/win32_compat.h"
 
+#include <SDL3/SDL_init.h>
 #include <SDL3/SDL_keyboard.h>
 #include <SDL3/SDL_mouse.h>
 #include <SDL3/SDL_video.h>
@@ -8,6 +9,8 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <memory>
+#include <mutex>
 
 #include "app/app.h"
 
@@ -17,15 +20,18 @@ namespace {
 std::atomic<bool> g_hidden{false};
 // the cursor as the game sees it: SDL's while it shows; while the game hides it (mouse look) the window is in relative
 // mode and this moves by the mouse's own motion, since Wayland lets no program move the real pointer
-std::atomic<float> g_x{0}, g_y{0};
+// one lock for both: the window thread moves it while the pad thread reads and recentres it for mouse look
+std::mutex g_cursor_lock;
+float g_x = 0, g_y = 0;
 
 SDL_Window* Game() { return static_cast<SDL_Window*>(app::Window()); }
 }
 
 void MouseMoved(float x, float y, float dx, float dy) {
+    std::lock_guard lock(g_cursor_lock);
     if (g_hidden) {
-        g_x = g_x + dx;
-        g_y = g_y + dy;
+        g_x += dx;
+        g_y += dy;
     } else {
         g_x = x;
         g_y = y;
@@ -88,7 +94,13 @@ void ShowCursorAgain() {
     if (!g_hidden.exchange(false)) return;
     if (SDL_Window* w = Game()) {
         SDL_SetWindowRelativeMouseMode(w, false);
-        SDL_WarpMouseInWindow(w, g_x, g_y);  // back where the game last put it (honoured where the system allows)
+        float x, y;
+        {
+            std::lock_guard lock(g_cursor_lock);
+            x = g_x;
+            y = g_y;
+        }
+        SDL_WarpMouseInWindow(w, x, y);  // back where the game last put it (honoured where the system allows)
     }
     SDL_ShowCursor();
 }
@@ -151,16 +163,30 @@ BOOL GetClientRect(HWND hwnd, RECT* rc) {
 }
 
 BOOL GetCursorPos(POINT* p) {
+    std::lock_guard lock(win32_compat::g_cursor_lock);
     *p = {int32_t(win32_compat::g_x), int32_t(win32_compat::g_y)};
     return 1;
 }
 
 BOOL SetCursorPos(int x, int y) {
-    win32_compat::g_x = float(x);
-    win32_compat::g_y = float(y);
-    // hidden, the window is in relative mode: the position is the game's alone
-    if (!win32_compat::g_hidden)
-        if (SDL_Window* w = GameWindow()) SDL_WarpMouseInWindow(w, float(x), float(y));
+    {
+        std::lock_guard lock(win32_compat::g_cursor_lock);
+        win32_compat::g_x = float(x);
+        win32_compat::g_y = float(y);
+    }
+    // hidden, the window is in relative mode: the position is the game's alone. Shown, the pointer moves on SDL's
+    // main thread (any thread calls this; SDL's video calls belong to that one)
+    if (!win32_compat::g_hidden && GameWindow()) {
+        struct To {
+            float x, y;
+        };
+        SDL_RunOnMainThread(
+            [](void* p) {
+                std::unique_ptr<To> to(static_cast<To*>(p));
+                if (SDL_Window* w = GameWindow()) SDL_WarpMouseInWindow(w, to->x, to->y);
+            },
+            new To{float(x), float(y)}, false);
+    }
     return 1;
 }
 
