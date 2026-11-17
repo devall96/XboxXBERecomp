@@ -35,6 +35,9 @@ struct Settings {
     DisplayMode display_mode = DisplayMode::Borderless;
     uint32_t width = 0, height = 0;  // 0 is the desktop mode
     uint32_t render_percent = 100;   // of the output height
+    // the game's own resolution exactly (render scale 1), shown scaled to the window: a game's console look (Unchained's OG Graphics) sets it
+    // (not in the settings file; the game's preset decides it at each start)
+    bool console_resolution = false;
     uint32_t fps_cap = 60;           // 0 unlimited, kFpsCapRefresh the monitor's refresh rate
     bool vsync = true;                 // vsync_mode != Off, kept for older settings files
     VSync vsync_mode = VSync::On;

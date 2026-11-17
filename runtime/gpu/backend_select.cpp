@@ -19,6 +19,7 @@ std::unique_ptr<Backend> CreateBackend() {
     return CreateD3D12Backend();
 #elif defined(XBE_VULKAN)
     g_vulkan_chosen = true;
+    LOGR("Renderer: Vulkan");
     return CreateVulkanBackend();
 #else
     return nullptr;

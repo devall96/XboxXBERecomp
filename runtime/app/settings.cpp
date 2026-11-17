@@ -286,7 +286,7 @@ float WideFactor() {
 }
 
 float RenderScale(uint32_t guest_width, uint32_t guest_height) {
-    if (!guest_width || !guest_height) return 1.0f;
+    if (!guest_width || !guest_height || Get().console_resolution) return 1.0f;
     Mode m = Shown();
     float vw = float(kGame.view_w ? kGame.view_w : guest_width);
     float vh = float(kGame.view_h ? kGame.view_h : guest_height);
