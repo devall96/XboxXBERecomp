@@ -17,23 +17,27 @@ FetchContent_Declare(imgui GIT_REPOSITORY https://github.com/ocornut/imgui.git G
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
 set(SDL_STATIC ON CACHE BOOL "" FORCE)
 set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
-set(SDL_RENDER OFF CACHE BOOL "" FORCE)
+# Linux draws a game's own windows before the game's (a launcher) with SDL's renderer
+if(WIN32)
+    set(SDL_RENDER OFF CACHE BOOL "" FORCE)
+else()
+    set(SDL_RENDER ON CACHE BOOL "" FORCE)
+endif()
 set(SDL_GPU OFF CACHE BOOL "" FORCE)
 set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
 # guest threads read the pads, which SDL's debug-only main thread checks reject
 set(SDL_ASSERTIONS release CACHE STRING "" FORCE)
 FetchContent_Declare(SDL3 GIT_REPOSITORY https://github.com/libsdl-org/SDL.git GIT_TAG release-3.4.16 GIT_SHALLOW TRUE)
-FetchContent_MakeAvailable(zydis tomlplusplus imgui)
-# Linux takes the system's SDL3 (its video backends need the desktop's development packages to build from source);
-# the release package carries the library
+FetchContent_MakeAvailable(zydis tomlplusplus imgui SDL3)
+set(XBE_SDL_INCLUDE ${sdl3_SOURCE_DIR}/include)
 if(WIN32)
-    FetchContent_MakeAvailable(SDL3)
     set(XBE_SDL_LIB $<LINK_ONLY:SDL3::SDL3-static>)
-    set(XBE_SDL_INCLUDE ${sdl3_SOURCE_DIR}/include)
 else()
-    find_package(SDL3 REQUIRED CONFIG)
-    set(XBE_SDL_LIB SDL3::SDL3-shared)
-    get_target_property(XBE_SDL_INCLUDE SDL3::Headers INTERFACE_INCLUDE_DIRECTORIES)
+    # static as on Windows: SDL loads the desktop's Wayland, X11, PipeWire and PulseAudio itself, so a release runs on
+    # what the player's system has. Building it needs their development packages (Wayland, xkbcommon, X11, PipeWire,
+    # PulseAudio, ALSA, libdecor). The oldest glibc symbol versions for it too (core/glibc_compat.h).
+    set(XBE_SDL_LIB SDL3::SDL3-static)
+    target_compile_options(SDL3-static PRIVATE -include ${CMAKE_CURRENT_LIST_DIR}/../runtime/core/glibc_compat.h)
 endif()
 
 # What the game needs to build its code on the player's PC (runtime/app/game_code.cpp), beside the executables: the
@@ -228,6 +232,8 @@ function(add_xbe_image target xbe config partitions game_dir)
         # executable start before the library exists
         target_link_libraries(${target} PRIVATE ${CMAKE_DL_LIBS} pthread)
         target_link_options(${target} PRIVATE -fuse-ld=lld -Wl,-z,lazy)
+        # the oldest glibc symbol versions where a newer glibc added its own (core/glibc_compat.h)
+        target_compile_options(${target} PRIVATE -include ${XBE_SDK_DIR}/runtime/core/glibc_compat.h)
         set_target_properties(${target} PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
     endif()
 
