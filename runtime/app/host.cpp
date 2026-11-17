@@ -7,6 +7,10 @@
 #include "app/app.h"
 #include "core/platform.h"
 
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+
 namespace app {
 
 std::filesystem::path DataDir() {
@@ -21,6 +25,19 @@ std::filesystem::path DataDir() {
             std::filesystem::create_directories(p, ec);
             if (p.is_absolute() && std::filesystem::is_directory(p, ec)) return p;
         }
+#ifndef _WIN32
+        // an AppImage, or an installed copy, runs from a folder it cannot write: the player's data goes to
+        // $XDG_DATA_HOME/<name> (~/.local/share/<name>)
+        if (!platform::Env(L"APPIMAGE").empty() || access(ExeDir().c_str(), W_OK) != 0) {
+            std::wstring xdg = platform::Env(L"XDG_DATA_HOME");
+            std::filesystem::path base = xdg.empty() ? std::filesystem::path(platform::Env(L"HOME")) / ".local" / "share"
+                                                     : std::filesystem::path(xdg);
+            std::filesystem::path p = base / kGame.name;
+            std::error_code ec;
+            std::filesystem::create_directories(p, ec);
+            if (!ec) return p;
+        }
+#endif
         return ExeDir();
     }();
     return dir;

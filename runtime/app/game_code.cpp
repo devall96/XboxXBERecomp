@@ -123,6 +123,14 @@ int64_t NowMs() {
 }
 
 fs::path CompilerDir() { return ExeDir() / "compiler"; }
+// where the build writes its work and the finished library: the compiler folder, or (Linux, a folder the program
+// cannot write, as an AppImage's) gamecode/ in the data folder
+fs::path BuildDir() {
+#ifndef _WIN32
+    if (access(ExeDir().c_str(), W_OK) != 0) return DataDir() / "gamecode";
+#endif
+    return CompilerDir();
+}
 
 uint32_t EntryOf(const std::vector<uint8_t>& xbe) {
     xbe::Image image;
@@ -157,11 +165,13 @@ std::vector<Image> Images() {
     return images;
 }
 
-fs::path WorkDir(const Image& image) { return CompilerDir() / "work" / image.exe; }
+fs::path WorkDir(const Image& image) { return BuildDir() / "work" / image.exe; }
 #ifdef _WIN32
 fs::path CodeDll(const Image& image) { return ExeDir() / (image.exe + L".dll"); }
 #else
-fs::path CodeDll(const Image& image) { return ExeDir() / (L"lib" + image.exe + L".so"); }
+fs::path CodeDll(const Image& image) {
+    return (BuildDir() == CompilerDir() ? ExeDir() : BuildDir()) / (L"lib" + image.exe + L".so");
+}
 #endif
 fs::path ExeFile(const Image& image) { return ExeDir() / (image.exe + kExeSuffix); }
 fs::path StampFile(const Image& image) { return WorkDir(image) / "built.txt"; }
@@ -761,7 +771,7 @@ std::wstring Blocker(const std::vector<Target>& targets) {
         return L"Preparing the game needs 1 GB of free space on the drive it is on.";
 #else
     struct statvfs fsinfo{};
-    if (statvfs(CompilerDir().c_str(), &fsinfo) == 0 && uint64_t(fsinfo.f_bavail) * fsinfo.f_frsize < kDiskNeeded)
+    if (statvfs(BuildDir().c_str(), &fsinfo) == 0 && uint64_t(fsinfo.f_bavail) * fsinfo.f_frsize < kDiskNeeded)
         return L"Preparing the game needs 1 GB of free space on the drive it is on.";
 #endif
     return {};
@@ -1298,8 +1308,8 @@ private:
 #else
     BuildLock() {
         std::error_code ec;
-        fs::create_directories(CompilerDir(), ec);
-        fd_ = open((CompilerDir() / "build.lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+        fs::create_directories(BuildDir(), ec);
+        fd_ = open((BuildDir() / "build.lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
         if (fd_ >= 0) flock(fd_, LOCK_EX);
     }
     ~BuildLock() {
