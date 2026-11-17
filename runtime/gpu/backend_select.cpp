@@ -1,5 +1,5 @@
-// Which renderer draws: Windows builds have D3D12 and (XBE_VULKAN) Vulkan, chosen by the renderer setting, the other
-// one taking over when the chosen one fails to start; Linux has Vulkan alone
+// Which renderer draws: Windows builds have Vulkan (XBE_VULKAN, the default) and D3D12, chosen by the renderer
+// setting, D3D12 when HDR is on (HDR10 is its alone) or when Vulkan fails to start; Linux has Vulkan alone
 #include "app/app.h"
 #include "core/log.h"
 #include "gpu/backend.h"
@@ -12,8 +12,10 @@ bool g_vulkan_chosen = false;
 
 std::unique_ptr<Backend> CreateBackend() {
 #if defined(_WIN32) && defined(XBE_VULKAN)
-    g_vulkan_chosen = app::Get().renderer == app::kRendererVulkan;
-    LOGR("Renderer: %s", g_vulkan_chosen ? "Vulkan" : "Direct3D 12");
+    const app::Settings& s = app::Get();
+    g_vulkan_chosen = s.renderer == app::kRendererVulkan && !s.hdr;  // HDR10 output is D3D12's alone
+    LOGR("Renderer: %s%s", g_vulkan_chosen ? "Vulkan" : "Direct3D 12",
+         s.renderer == app::kRendererVulkan && s.hdr ? " (HDR is on: HDR10 is drawn with Direct3D 12)" : "");
     return g_vulkan_chosen ? CreateVulkanBackend() : CreateD3D12Backend();
 #elif defined(_WIN32)
     return CreateD3D12Backend();
