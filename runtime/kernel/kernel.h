@@ -212,6 +212,8 @@ const std::string& KeptPicture();
 // A relaunch hands over without a gap: the new instance's window opens once it has presented, then it signals this
 // event and the old instance, waiting in Relaunch with its window still up, exits.
 std::wstring HandoverEvent(unsigned long process);
+// Linux: the environment variable holding the pipe a relaunched instance writes to after its first frames
+inline constexpr char kHandoverFd[] = "XBE_HANDOVER_FD";
 inline std::atomic<bool> g_relaunching{false};
 
 using KernelFn = void (*)(X86Context& ctx, uint8_t* base);

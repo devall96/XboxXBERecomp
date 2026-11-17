@@ -1,4 +1,5 @@
 // the log's opening lines: what the game runs on and with which settings
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -7,6 +8,14 @@
 #endif
 #include <windows.h>
 #include <intrin.h>
+#else
+#include <SDL3/SDL_video.h>
+#include <cpuid.h>
+#include <sys/utsname.h>
+#include <unistd.h>
+
+#include <fstream>
+#endif
 
 #include <algorithm>
 #include <cstdlib>
@@ -19,12 +28,15 @@
 #include "core/log.h"
 #include "image_symbols.h"
 
+#ifdef _WIN32
 #pragma comment(lib, "advapi32.lib")
+#endif
 
 namespace app {
 
 namespace {
 
+#ifdef _WIN32
 std::string RegString(HKEY key, const char* name) {
     char text[256] = {};
     DWORD size = sizeof(text) - 1;
@@ -52,6 +64,29 @@ std::string OsVersion() {
         name += std::string(" on Wine ") + wine();
     return name;
 }
+#else
+// PRETTY_NAME from os-release, and the kernel
+std::string OsVersion() {
+    std::string name = "Linux";
+    std::ifstream f("/etc/os-release");
+    for (std::string line; std::getline(f, line);) {
+        if (line.rfind("PRETTY_NAME=", 0) != 0) continue;
+        name = line.substr(12);
+        if (name.size() >= 2 && name.front() == '"') name = name.substr(1, name.size() - 2);
+    }
+    utsname u{};
+    if (uname(&u) == 0) name += std::string(" (kernel ") + u.release + ")";
+    if (const char* session = std::getenv("XDG_SESSION_TYPE")) name += std::string(", ") + session;
+    return name;
+}
+
+#undef __cpuid  // cpuid.h's macro; MSVC's function form below
+void __cpuid(int r[4], int leaf) {
+    unsigned a, b, c, d;
+    __cpuid_count(unsigned(leaf), 0, a, b, c, d);
+    r[0] = int(a), r[1] = int(b), r[2] = int(c), r[3] = int(d);
+}
+#endif
 
 std::string CpuName() {
     int r[4] = {};
@@ -75,9 +110,10 @@ void LogSystem() {
     char date[32] = {};
     std::strftime(date, sizeof(date), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
     LOGR("%ls (%s), %s", kGame.title, IMAGE_XBE, date);
-    LOGR("Path: %ls", ExeDir().c_str());
-    if (DataDir() != ExeDir()) LOGR("Data: %ls", DataDir().c_str());
+    LOGR("Path: %ls", ExeDir().wstring().c_str());
+    if (DataDir() != ExeDir()) LOGR("Data: %ls", DataDir().wstring().c_str());
     LOGR("OS: %s", OsVersion().c_str());
+#ifdef _WIN32
     SYSTEM_INFO si{};
     GetNativeSystemInfo(&si);
     LOGR("CPU: %s (%lu threads)", CpuName().c_str(), si.dwNumberOfProcessors);
@@ -93,6 +129,11 @@ void LogSystem() {
         seen.emplace_back(dd.DeviceString);
         LOGR("GPU %zu: %s%s", seen.size(), dd.DeviceString, (dd.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) ? " (primary)" : "");
     }
+#else
+    LOGR("CPU: %s (%ld threads)", CpuName().c_str(), sysconf(_SC_NPROCESSORS_ONLN));
+    LOGR("RAM: %.1f GB", double(sysconf(_SC_PHYS_PAGES)) * double(sysconf(_SC_PAGE_SIZE)) / 1073741824.0);
+    LOGR("Video: %s", SDL_GetCurrentVideoDriver() ? SDL_GetCurrentVideoDriver() : "none");  // the GPU: the renderer's log
+#endif
     Mode desk = Desktop();
     LOGR("Desktop: %ux%u", desk.width, desk.height);
     LogSettings();

@@ -2,10 +2,13 @@
 #include <cstring>
 #include <cstdlib>
 #include <fstream>
+#include <string>
+#include <vector>
 
 #include "app/app.h"
 #include "kernel/kernel.h"
 
+#ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -13,6 +16,15 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#else
+#include <fcntl.h>
+#include <poll.h>
+#include <spawn.h>
+#include <unistd.h>
+
+#include "core/platform.h"
+extern char** environ;
+#endif
 #include "xbe/xbe.h"
 
 namespace dispatch {
@@ -169,6 +181,7 @@ std::wstring HandoverEvent(unsigned long process) {
     return L"Local\\" + std::wstring(app::kGame.name) + L"Handover-" + std::to_wstring(process);
 }
 
+#ifdef _WIN32
 void Relaunch(const char* exe) {
     logx::Flush();
     wchar_t self[MAX_PATH];
@@ -200,6 +213,45 @@ void Relaunch(const char* exe) {
     }
     std::_Exit(0);
 }
+#else
+// The new instance gets the write end of a pipe (kHandoverFd in its environment) and writes to it once it has shown
+// its first frames (app/handover.cpp); its exit closes it too
+void Relaunch(const char* exe) {
+    logx::Flush();
+    std::string path = (platform::ExePath().parent_path() / exe).string();
+    std::vector<std::string> args = platform::Args();
+    if (args.empty()) args.push_back(path);
+    args[0] = path;
+    bool marked = false;
+    for (auto& a : args) marked |= a == "--relaunched";
+    if (!marked) args.push_back("--relaunched");  // no boot splash again
+    xnet::CloseSockets();
+    int fds[2] = {-1, -1};
+    if (pipe(fds) != 0) fds[0] = fds[1] = -1;
+    if (fds[0] >= 0) fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+    std::vector<std::string> env;
+    for (char** e = environ; *e; e++)
+        if (std::strncmp(*e, kHandoverFd, std::strlen(kHandoverFd)) != 0) env.push_back(*e);
+    if (fds[1] >= 0) env.push_back(std::string(kHandoverFd) + "=" + std::to_string(fds[1]));
+    std::vector<char*> argv, envp;
+    for (auto& a : args) argv.push_back(a.data());
+    argv.push_back(nullptr);
+    for (auto& e : env) envp.push_back(e.data());
+    envp.push_back(nullptr);
+    pid_t pid = 0;
+    if (posix_spawn(&pid, path.c_str(), nullptr, nullptr, argv.data(), envp.data()) == 0) {
+        g_relaunching = true;
+        if (fds[1] >= 0) close(fds[1]);
+        if (fds[0] >= 0) {
+            pollfd p{fds[0], POLLIN, 0};
+            poll(&p, 1, 15000);
+        }
+    } else {
+        LOGE("relaunch: cannot start %s", path.c_str());
+    }
+    std::_Exit(0);
+}
+#endif
 
 void Shutdown(int code) {
     LOGR("Exit (%d)", code);

@@ -1,4 +1,5 @@
 // the settings file beside the exe
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -6,6 +7,9 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <SDL3/SDL_video.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -151,7 +155,12 @@ void Save() {
     std::ofstream f(tmp);
     f << Table() << "\n";
     f.close();
+#ifdef _WIN32
     if (f) MoveFileExW(tmp.c_str(), File().c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+#else
+    std::error_code ec;
+    if (f) std::filesystem::rename(tmp, File(), ec);  // rename replaces atomically
+#endif
 }
 
 void LogSettings() {
@@ -163,6 +172,7 @@ void LogSettings() {
         if (!line.empty()) LOGR("  %s", line.c_str());
 }
 
+#ifdef _WIN32
 Mode Desktop() {
     HMONITOR mon = MonitorFromWindow(static_cast<HWND>(Window()), MONITOR_DEFAULTTOPRIMARY);
     MONITORINFOEXW mi{};
@@ -173,6 +183,23 @@ Mode Desktop() {
         return {dm.dmPelsWidth, dm.dmPelsHeight};
     return {uint32_t(GetSystemMetrics(SM_CXSCREEN)), uint32_t(GetSystemMetrics(SM_CYSCREEN))};
 }
+#else
+namespace {
+SDL_DisplayID WindowDisplay() {
+    SDL_DisplayID d = Window() ? SDL_GetDisplayForWindow(static_cast<SDL_Window*>(Window())) : 0;
+    return d ? d : SDL_GetPrimaryDisplay();
+}
+}  // namespace
+
+// the desktop's mode in pixels: a scaled Wayland desktop reports points, times its scale
+Mode Desktop() {
+    if (const SDL_DisplayMode* m = SDL_GetDesktopDisplayMode(WindowDisplay())) {
+        float k = m->pixel_density > 0 ? m->pixel_density : 1.0f;
+        return {uint32_t(m->w * k + 0.5f), uint32_t(m->h * k + 0.5f)};
+    }
+    return {1920, 1080};
+}
+#endif
 
 Mode Output() {
     const Settings& s = Get();
@@ -186,14 +213,22 @@ Mode CachedOutput() {
     struct Key {
         uint32_t width;
         uint32_t height;
+#ifdef _WIN32
         HMONITOR monitor;
+#else
+        SDL_DisplayID monitor;
+#endif
         bool operator==(const Key&) const = default;
     };
     static std::mutex lock;
     static Key key{};
     static Mode mode{};
     const Settings& s = Get();
+#ifdef _WIN32
     Key now{s.width, s.height, MonitorFromWindow(static_cast<HWND>(Window()), MONITOR_DEFAULTTOPRIMARY)};
+#else
+    Key now{s.width, s.height, WindowDisplay()};
+#endif
     std::lock_guard<std::mutex> guard(lock);
     if (!(now == key) || !mode.height) {
         key = now;

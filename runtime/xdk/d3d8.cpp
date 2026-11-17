@@ -1,5 +1,6 @@
 // Direct3D 8 (XDK 4831, 5659 and 5849) entry points the title calls, implemented on the host renderer.
 // Resource creation, locking and the XG helpers stay recompiled: they only manage memory.
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -7,8 +8,11 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#endif
 
 #include <algorithm>
+
+#include "core/platform.h"
 #include <atomic>
 #include <chrono>
 #include <map>
@@ -325,10 +329,17 @@ void SetFrameBuffers(const char* caller, uint32_t pp) {
         if (!g_backend->Init(w, h)) {
             LOGE("d3d: renderer init failed");
             // no owner window: this runs on the title's thread and the window may already be fullscreen over the box
+#ifdef _WIN32
             MessageBoxW(nullptr,
                         L"Direct3D 12 could not be started. Make sure your graphics card supports it and its driver "
                         L"is up to date.",
                         app::kGame.short_title, MB_ICONERROR | MB_TOPMOST);
+#else
+            platform::Message(app::kGame.short_title,
+                              L"The renderer could not be started. Make sure your graphics card supports Vulkan and "
+                              L"its driver is up to date.",
+                              true);
+#endif
             kernel::Shutdown(1);
         }
         g_backend = gpu::CreateThreadedBackend(std::move(g_backend));

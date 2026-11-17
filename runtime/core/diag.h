@@ -3,6 +3,8 @@
 #include <filesystem>
 #include <vector>
 
+#include "core/platform.h"
+
 // diagnostics switched on by environment variables, read once
 namespace diag {
 
@@ -15,8 +17,8 @@ inline bool Perf() {
 // XBE_CAPTURE_DIR: where F3 saves a frame, empty: F3 does not capture
 inline const std::filesystem::path& CaptureDir() {
     static const std::filesystem::path dir = [] {
-        const wchar_t* v = _wgetenv(L"XBE_CAPTURE_DIR");
-        return v ? std::filesystem::path(v) : std::filesystem::path();
+        std::wstring v = platform::Env(L"XBE_CAPTURE_DIR");
+        return v.empty() ? std::filesystem::path() : std::filesystem::path(v);
     }();
     return dir;
 }
@@ -25,8 +27,8 @@ inline const std::filesystem::path& CaptureDir() {
 // time suites (1% lows, hitches); empty: none
 inline const std::filesystem::path& FrameTimesFile() {
     static const std::filesystem::path file = [] {
-        const wchar_t* v = _wgetenv(L"XBE_FRAMETIMES");
-        return v ? std::filesystem::path(v) : std::filesystem::path();
+        std::wstring v = platform::Env(L"XBE_FRAMETIMES");
+        return v.empty() ? std::filesystem::path() : std::filesystem::path(v);
     }();
     return file;
 }

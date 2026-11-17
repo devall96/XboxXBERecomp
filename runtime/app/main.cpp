@@ -1,4 +1,6 @@
-// the host: window, message loop, crash dumps; the game is described by app::kGame
+// the host: window, message loop, crash dumps; the game is described by app::kGame. Windows; Linux's is window_sdl.cpp,
+// what both share is host.cpp
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -176,43 +178,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 }  // namespace
 
-std::filesystem::path DataDir() {
-    static const std::filesystem::path dir = [] {
-        std::wstring var;
-        for (const wchar_t* c = kGame.name; *c; c++) var += wchar_t(std::towupper(*c));
-        var += L"_DATA_ROOT";
-        const wchar_t* v = _wgetenv(var.c_str());
-        if (v && *v) {
-            std::filesystem::path p(v);
-            std::error_code ec;
-            std::filesystem::create_directories(p, ec);
-            if (p.is_absolute() && std::filesystem::is_directory(p, ec)) return p;
-        }
-        return ExeDir();
-    }();
-    return dir;
-}
-
-std::filesystem::path ExeDir() {
-    wchar_t p[MAX_PATH];
-    GetModuleFileNameW(nullptr, p, MAX_PATH);
-    return std::filesystem::path(p).parent_path();
-}
-
-int Instance() {
-    static const int n = [] {
-        const wchar_t* p = std::wcsstr(GetCommandLineW(), L"--instance");
-        return p ? std::max(0, std::min(8, _wtoi(p + 10))) : 0;
-    }();
-    return n;
-}
-
 void* Window() { return g_hwnd; }
-
-std::recursive_mutex& UiLock() {
-    static std::recursive_mutex m;
-    return m;
-}
 
 void ApplyDisplay() { PostMessageW(g_hwnd, kApplyDisplay, 0, 0); }
 void OpenGameWindow(bool apply) { SendMessageW(g_hwnd, kOpenWindow, apply, 0); }
@@ -260,29 +226,6 @@ HdrInfo HdrDisplay(void* hwnd) {
     }
     f->Release();
     return info;
-}
-
-void Pace() {
-    using clock = std::chrono::steady_clock;
-    static clock::time_point next = clock::now();
-    uint32_t cap = Get().fps_cap;
-    if (cap == kFpsCapRefresh) cap = RefreshRate();
-    // VRR: under the refresh rate, so frames stay inside the display's variable range instead of meeting its ceiling
-    constexpr uint32_t kVrrMargin = 3;
-    if (Get().vsync_mode == VSync::Vrr) {
-        uint32_t hz = RefreshRate();
-        if (hz > kVrrMargin * 10 && (!cap || cap > hz - kVrrMargin)) cap = hz - kVrrMargin;
-    }
-    auto now = clock::now();
-    if (!cap) {
-        next = now;
-        return;
-    }
-    auto period = std::chrono::nanoseconds(1000000000ull / cap);
-    next += period;
-    if (next < now - period) next = now;
-    while (clock::now() + std::chrono::milliseconds(2) < next) Sleep(1);
-    while (clock::now() < next) std::this_thread::yield();
 }
 
 }  // namespace app
@@ -356,3 +299,4 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     logx::Flush();
     kernel::Shutdown(0);
 }
+#endif

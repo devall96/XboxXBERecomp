@@ -3,7 +3,7 @@
 #include <filesystem>
 #include <vector>
 
-#include <dxgiformat.h>
+#include "gpu/dxgi_format.h"
 
 #include "gpu/texture.h"
 

@@ -1,4 +1,5 @@
 // The console's hard disk on the PC: where it lives (save_folder) and a copy of its saves at each start (save_backups)
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -6,6 +7,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -65,7 +67,11 @@ void BackupSaves() {
     if (Instance() > 1) root += std::to_wstring(Instance());
     std::time_t now = std::time(nullptr);
     std::tm tm{};
+#ifdef _WIN32
     localtime_s(&tm, &now);
+#else
+    localtime_r(&now, &tm);
+#endif
     wchar_t stamp[32];
     wcsftime(stamp, 32, L"%Y-%m-%d %H%M%S", &tm);
     fs::path dest = root / stamp;

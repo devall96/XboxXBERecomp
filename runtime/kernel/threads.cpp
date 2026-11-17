@@ -6,8 +6,14 @@
 
 #include "kernel/kernel.h"
 
+#include "core/platform.h"
+
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#else
+#include <pthread.h>
+#endif
 
 namespace kernel {
 
@@ -77,27 +83,10 @@ void MarkExited(Thread& t, uint32_t code) {
     SignalChanged();
 }
 
-void NameHostThread(const char* name) {
-    wchar_t w[64];
-    size_t i = 0;
-    for (; name[i] && i < 63; i++) w[i] = wchar_t(name[i]);
-    w[i] = 0;
-    using Fn = HRESULT(WINAPI*)(HANDLE, PCWSTR);
-    static Fn set = reinterpret_cast<Fn>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadDescription")));
-    if (set) set(GetCurrentThread(), w);
-}
+void NameHostThread(const char* name) { platform::NameThread(name); }
 
 // recompiled code nests host frames as deep as the guest's calls, give it room
-void Spawn(std::function<void()> fn) {
-    auto* f = new std::function<void()>(std::move(fn));
-    auto entry = [](void* p) -> DWORD {
-        std::unique_ptr<std::function<void()>> g(static_cast<std::function<void()>*>(p));
-        (*g)();
-        return 0;
-    };
-    HANDLE h = ::CreateThread(nullptr, 64u << 20, entry, f, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
-    if (h) ::CloseHandle(h);
-}
+void Spawn(std::function<void()> fn) { platform::SpawnThread(64u << 20, std::move(fn)); }
 
 }  // namespace
 
@@ -185,7 +174,11 @@ void ExitThread(uint32_t code) {
         Unregister(t);
     }
     t_current.reset();
+#ifdef _WIN32
     ::ExitThread(code);
+#else
+    pthread_exit(nullptr);  // unwinds the host frames under it, as ExitThread leaves them
+#endif
 }
 
 void Resume(Thread& t) {

@@ -1,4 +1,5 @@
-// mixer output through XAudio2
+// mixer output through XAudio2; Linux's is sdl_audio.cpp
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -259,3 +260,4 @@ void StartOutput(std::function<void(float*, uint32_t)> render) {
 }
 
 }  // namespace audio
+#endif

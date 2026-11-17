@@ -23,7 +23,18 @@ set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
 # guest threads read the pads, which SDL's debug-only main thread checks reject
 set(SDL_ASSERTIONS release CACHE STRING "" FORCE)
 FetchContent_Declare(SDL3 GIT_REPOSITORY https://github.com/libsdl-org/SDL.git GIT_TAG release-3.4.16 GIT_SHALLOW TRUE)
-FetchContent_MakeAvailable(zydis tomlplusplus imgui SDL3)
+FetchContent_MakeAvailable(zydis tomlplusplus imgui)
+# Linux takes the system's SDL3 (its video backends need the desktop's development packages to build from source);
+# the release package carries the library
+if(WIN32)
+    FetchContent_MakeAvailable(SDL3)
+    set(XBE_SDL_LIB $<LINK_ONLY:SDL3::SDL3-static>)
+    set(XBE_SDL_INCLUDE ${sdl3_SOURCE_DIR}/include)
+else()
+    find_package(SDL3 REQUIRED CONFIG)
+    set(XBE_SDL_LIB SDL3::SDL3-shared)
+    get_target_property(XBE_SDL_INCLUDE SDL3::Headers INTERFACE_INCLUDE_DIRECTORIES)
+endif()
 
 # What the game needs to build its code on the player's PC (runtime/app/game_code.cpp), beside the executables: the
 # recompiler, clang and lld from the toolchain building this, the game's configs, the XDK layouts they include and the
@@ -41,11 +52,15 @@ foreach(layout ${XBE_LAYOUTS})
     list(APPEND XBE_COPY_LAYOUTS COMMAND ${CMAKE_COMMAND} -E make_directory ${XBE_COMPILER_DIR}/xdk/${build}
          COMMAND ${CMAKE_COMMAND} -E copy_if_different ${layout} ${XBE_COMPILER_DIR}/xdk/${build})
 endforeach()
+# Linux: clang and ld.lld are the system's (game_code.cpp finds them), the package brings its own
+if(WIN32)
+    set(XBE_COPY_LLVM COMMAND ${CMAKE_COMMAND} -E copy_if_different ${XBE_LLVM_BIN}/clang.exe ${XBE_LLVM_BIN}/lld-link.exe
+        ${XBE_SDK_DIR}/tools/LLVM-LICENSE.txt ${XBE_COMPILER_DIR})
+endif()
 add_custom_target(compiler_files ALL
     COMMAND ${CMAKE_COMMAND} -E make_directory ${XBE_COMPILER_DIR}/config ${XBE_COMPILER_DIR}/include/cpu
             ${XBE_COMPILER_DIR}/include/freestanding
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${XBE_LLVM_BIN}/clang.exe ${XBE_LLVM_BIN}/lld-link.exe
-            ${XBE_SDK_DIR}/tools/LLVM-LICENSE.txt ${XBE_COMPILER_DIR}
+    ${XBE_COPY_LLVM}
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${XBE_GAME_CONFIGS} ${XBE_COMPILER_DIR}/config
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${XBE_COMPILER_HEADERS} ${XBE_COMPILER_DIR}/include/cpu
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${XBE_FREESTANDING_HEADERS} ${XBE_COMPILER_DIR}/include/freestanding
@@ -70,13 +85,33 @@ set(XBE_IMGUI_SOURCES
     ${imgui_SOURCE_DIR}/imgui.cpp
     ${imgui_SOURCE_DIR}/imgui_draw.cpp
     ${imgui_SOURCE_DIR}/imgui_tables.cpp
-    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
-    ${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp
-    ${imgui_SOURCE_DIR}/backends/imgui_impl_dx12.cpp)
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp)
+if(WIN32)
+    list(APPEND XBE_IMGUI_SOURCES ${imgui_SOURCE_DIR}/backends/imgui_impl_dx12.cpp
+                                  ${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp)
+else()
+    list(APPEND XBE_IMGUI_SOURCES ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp)
+    # this ImGui's SDL3 backend predates SDL 3.2's renames
+    set_source_files_properties(${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp PROPERTIES COMPILE_DEFINITIONS SDL_ENABLE_OLD_NAMES)
+endif()
 
 file(GLOB XBE_RUNTIME_SOURCES CONFIGURE_DEPENDS ${XBE_SDK_DIR}/runtime/*/*.cpp)
+# Linux draws through the D3D12 renderer on vkd3d (Direct3D 12 on Vulkan), found in XBE_VKD3D_DIR or the system;
+# without it the build runs with a backend that draws nothing (gpu/null_backend.cpp)
+set(XBE_RENDERER_DEFS)
+if(NOT WIN32)
+    set(XBE_VKD3D_DIR "" CACHE PATH "vkd3d install prefix (include/vkd3d, lib)")
+    find_path(XBE_VKD3D_INCLUDE vkd3d_d3d12.h HINTS ${XBE_VKD3D_DIR}/include PATH_SUFFIXES vkd3d)
+    find_library(XBE_VKD3D_LIB vkd3d HINTS ${XBE_VKD3D_DIR}/lib)
+    find_library(XBE_VKD3D_UTILS_LIB vkd3d-utils HINTS ${XBE_VKD3D_DIR}/lib)
+    if(NOT XBE_VKD3D_INCLUDE OR NOT XBE_VKD3D_LIB OR NOT XBE_VKD3D_UTILS_LIB)
+        message(STATUS "vkd3d not found: the Linux build draws nothing")
+        list(FILTER XBE_RUNTIME_SOURCES EXCLUDE REGEX "/gpu/d3d12\.cpp$")
+        set(XBE_RENDERER_DEFS XBE_NO_RENDERER)
+    endif()
+endif()
 # SDL's headers go to the input code alone (it is linked LINK_ONLY)
-set_source_files_properties(${XBE_SDK_DIR}/runtime/core/input.cpp PROPERTIES INCLUDE_DIRECTORIES "${sdl3_SOURCE_DIR}/include")
+set_source_files_properties(${XBE_SDK_DIR}/runtime/core/input.cpp PROPERTIES INCLUDE_DIRECTORIES "${XBE_SDL_INCLUDE}")
 
 # One executable per recompiled image: the SDK runtime, XBE_HOST_SOURCES shared by every image of the game, and
 # src/<game_dir> hooks only this image has. The image's code goes to <target>.dll beside it, which the executable delay
@@ -92,12 +127,18 @@ function(add_xbe_image target xbe config partitions game_dir)
         list(APPEND GEN_SOURCES ${GEN}/x86_recomp.${i}.cpp)
     endforeach()
     file(GLOB configs CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/config/*.toml ${XBE_SDK_DIR}/xdk/*/*.toml)
+    # Windows: the executable delay loads the DLL through an import library. Linux needs none: the executable's weak
+    # references to recompiled bodies bind lazily, at their first call, to the library loaded with RTLD_GLOBAL.
+    set(import_lib)
+    if(WIN32)
+        set(import_lib COMMAND ${XBE_LLVM_BIN}/lld-link.exe /lib /machine:x64 /def:${GEN}/imports.def /out:${GEN}/code.lib)
+    endif()
     add_custom_command(
         OUTPUT ${GEN}/codegen.stamp
         BYPRODUCTS ${GEN_SOURCES} ${GEN}/x86_recomp_shared.h ${GEN}/image_symbols.h ${GEN}/hook_exports.h
                    ${GEN}/exports.def ${GEN}/imports.def ${GEN}/code.lib
         COMMAND xbe_recomp config/${config} --xdk ${XBE_SDK_DIR}/xdk
-        COMMAND ${XBE_LLVM_BIN}/lld-link.exe /lib /machine:x64 /def:${GEN}/imports.def /out:${GEN}/code.lib
+        ${import_lib}
         COMMAND ${CMAKE_COMMAND} -E touch ${GEN}/codegen.stamp
         DEPENDS xbe_recomp ${configs} ${CMAKE_CURRENT_SOURCE_DIR}/assets/${xbe}
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
@@ -118,10 +159,20 @@ function(add_xbe_image target xbe config partitions game_dir)
     target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${XBE_SDK_DIR}/runtime ${GEN})
     target_include_directories(${target} SYSTEM PRIVATE ${imgui_SOURCE_DIR})
     target_compile_options(${target} PRIVATE -fno-strict-aliasing)
-    target_compile_definitions(${target} PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
-    target_link_libraries(${target} PRIVATE tomlplusplus::tomlplusplus $<LINK_ONLY:SDL3::SDL3-static> d3d12 dxgi dxguid d3dcompiler xaudio2 ole32 windowscodecs dbghelp winmm dwmapi ws2_32)
-    target_link_libraries(${target} PRIVATE ${GEN}/code.lib delayimp)
-    target_link_options(${target} PRIVATE -fuse-ld=lld -g -Wl,/delayload:${target}.dll)
+    target_compile_definitions(${target} PRIVATE ${XBE_RENDERER_DEFS})
+    target_link_libraries(${target} PRIVATE tomlplusplus::tomlplusplus ${XBE_SDL_LIB})
+    if(WIN32)
+        target_compile_definitions(${target} PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+        target_link_libraries(${target} PRIVATE d3d12 dxgi dxguid d3dcompiler xaudio2 ole32 windowscodecs dbghelp winmm dwmapi ws2_32)
+        target_link_libraries(${target} PRIVATE ${GEN}/code.lib delayimp)
+        target_link_options(${target} PRIVATE -fuse-ld=lld -g -Wl,/delayload:${target}.dll)
+    else()
+        # -rdynamic (ENABLE_EXPORTS) gives the library the runtime and the overrides; lazy binding is what lets the
+        # executable start before the library exists
+        target_link_libraries(${target} PRIVATE ${CMAKE_DL_LIBS} pthread)
+        target_link_options(${target} PRIVATE -fuse-ld=lld -Wl,-z,lazy)
+        set_target_properties(${target} PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
+    endif()
 
     # without a C runtime: the executable passes on what the code calls
     add_library(${target}_code SHARED ${GEN_SOURCES})
@@ -131,11 +182,18 @@ function(add_xbe_image target xbe config partitions game_dir)
     target_include_directories(${target}_code PRIVATE ${XBE_SDK_DIR}/runtime ${GEN})
     target_include_directories(${target}_code SYSTEM PRIVATE ${XBE_SDK_DIR}/runtime/cpu/freestanding)
     target_compile_definitions(${target}_code PRIVATE X86_GAME_CODE)
-    target_compile_options(${target}_code PRIVATE -fms-compatibility-version=19.40 -O2 -fno-strict-aliasing -nostdinc
-        -nostdinc++ -w)
-    target_link_libraries(${target}_code PRIVATE ${target})
-    target_link_options(${target}_code PRIVATE -fuse-ld=lld -Wl,/noentry,/nodefaultlib,/opt:noicf
-        -Wl,/def:${GEN}/exports.def)
+    if(WIN32)
+        target_compile_options(${target}_code PRIVATE -fms-compatibility-version=19.40 -O2 -fno-strict-aliasing -nostdinc
+            -nostdinc++ -w)
+        target_link_libraries(${target}_code PRIVATE ${target})
+        target_link_options(${target}_code PRIVATE -fuse-ld=lld -Wl,/noentry,/nodefaultlib,/opt:noicf
+            -Wl,/def:${GEN}/exports.def)
+    else()
+        # lib<target>.so; what it calls of the runtime and the C library resolves against the executable at load time.
+        # No -Bsymbolic: a recompiled function the executable overrides must bind to the override.
+        target_compile_options(${target}_code PRIVATE -O2 -fPIC -fno-strict-aliasing -nostdinc -nostdinc++ -w)
+        target_link_options(${target}_code PRIVATE -fuse-ld=lld -nostdlib -Wl,-z,undefs -Wl,--icf=none)
+    endif()
     # a stamp from an earlier build on the executable's first start would outrank this DLL
     add_custom_command(TARGET ${target}_code POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E rm -f ${XBE_COMPILER_DIR}/work/${target}/built.txt)

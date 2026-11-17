@@ -1,5 +1,6 @@
 #include "gpu/texturedumper.h"
 
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -9,15 +10,22 @@
 #include <windows.h>
 #include <wincodec.h>
 #include <wrl/client.h>
+#else
+// Linux: PNG through SDL, the BC formats unpacked here
+#include <SDL3/SDL_surface.h>
+#include <strings.h>
+#endif
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <cwctype>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -34,7 +42,9 @@
 #include "core/log.h"
 #include "gpu/shaders.h"
 
+#ifdef _WIN32
 using Microsoft::WRL::ComPtr;
+#endif
 
 namespace gpu::texturedumper {
 
@@ -48,8 +58,23 @@ constexpr uint32_t kDumpDds = 1;      // texture_dump_format
 constexpr size_t kPaletteBytes = 256 * 4;
 constexpr auto kSettle = std::chrono::milliseconds(500);  // files still being copied in
 constexpr uint32_t kWatchRetry = 120;  // presents between tries while the pack folder is missing
+#ifdef _WIN32
 constexpr DWORD kPackChanges = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
                                FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE;
+#endif
+
+// a file name's extension, any case
+bool HasExtension(const fs::path& p, const wchar_t* ext) {
+#ifdef _WIN32
+    return _wcsicmp(p.extension().c_str(), ext) == 0;
+#else
+    std::wstring e = p.extension().wstring();
+    if (e.size() != std::wcslen(ext)) return false;
+    for (size_t i = 0; i < e.size(); i++)
+        if (std::towlower(e[i]) != std::towlower(ext[i])) return false;
+    return true;
+#endif
+}
 
 using Clock = std::chrono::steady_clock;
 
@@ -68,7 +93,12 @@ struct Pack {
     fs::path pack_dir;
     fs::path dump_dir;
     std::unordered_map<uint64_t, fs::path> files;  // by the key in their names; written by Update alone
+#ifdef _WIN32
     HANDLE watch = INVALID_HANDLE_VALUE;           // changes under pack_dir
+#else
+    bool watch = false;                            // pack_dir is there, its files' signature is polled
+    uint64_t watch_sig = 0;
+#endif
     uint32_t watch_tries = 0;
     std::optional<Clock::time_point> changed;      // the last change seen, not listed yet
     std::once_flag worker;
@@ -88,7 +118,9 @@ Pack g;
 // Worker
 
 void Work() {
+#ifdef _WIN32
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+#endif
     for (;;) {
         std::function<void()> job;
         {
@@ -184,7 +216,7 @@ void ListPack(const fs::path& dir) {
     fs::recursive_directory_iterator it(dir, ec);
     for (; !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
         const fs::path& p = it->path();
-        bool image = _wcsicmp(p.extension().c_str(), L".dds") == 0 || _wcsicmp(p.extension().c_str(), L".png") == 0;
+        bool image = HasExtension(p, L".dds") || HasExtension(p, L".png");
         uint64_t key = image ? KeyInName(p.stem().wstring()) : 0;
         if (key) g.files.emplace(key, p);
     }
@@ -342,6 +374,7 @@ void WriteDds(const fs::path& path, const Image& img) {
 
 // PNG and other WIC files
 
+#ifdef _WIN32
 IWICImagingFactory* Wic() {
     static ComPtr<IWICImagingFactory> wic;  // the worker's
     if (!wic) CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic));
@@ -399,6 +432,95 @@ void WritePng(const fs::path& path, const Image& img) {
     if (SUCCEEDED(hr)) hr = encoder->Commit();
     if (FAILED(hr)) LOGE("texture dump: %s not written (0x%08lx)", Utf8(path).c_str(), static_cast<unsigned long>(hr));
 }
+#else
+// one 4x4 block's colours from its two 5:6:5 ends, as BGRA; four of them, or three and black for BC1's punch-through
+void BlockColours(const uint8_t* b, bool four, uint8_t out[4][4]) {
+    uint16_t c0 = uint16_t(b[0] | b[1] << 8), c1 = uint16_t(b[2] | b[3] << 8);
+    auto expand = [](uint16_t c, uint8_t* o) {
+        o[2] = uint8_t(((c >> 11) & 31) * 255 / 31);
+        o[1] = uint8_t(((c >> 5) & 63) * 255 / 63);
+        o[0] = uint8_t((c & 31) * 255 / 31);
+        o[3] = 255;
+    };
+    expand(c0, out[0]);
+    expand(c1, out[1]);
+    for (int k = 0; k < 4; k++) {
+        if (four || c0 > c1) {
+            out[2][k] = uint8_t((2 * out[0][k] + out[1][k] + 1) / 3);
+            out[3][k] = uint8_t((out[0][k] + 2 * out[1][k] + 1) / 3);
+        } else {
+            out[2][k] = uint8_t((out[0][k] + out[1][k]) / 2);
+            out[3][k] = 0;
+        }
+    }
+    if (!four && c0 <= c1) out[2][3] = 255;
+}
+
+// BC1, BC2 and BC3 level 0 as BGRA rows packed; false for another (BC7, which only a texture pack brings)
+bool DecodeBc(const Image& img, std::vector<uint8_t>& px) {
+    const Level& top = img.levels[0];
+    uint32_t block = img.format == DXGI_FORMAT_BC1_UNORM ? 8 : 16;
+    if (img.format != DXGI_FORMAT_BC1_UNORM && img.format != DXGI_FORMAT_BC2_UNORM &&
+        img.format != DXGI_FORMAT_BC3_UNORM)
+        return false;
+    uint32_t bw = (img.width + 3) / 4, bh = (img.height + 3) / 4;
+    if (size_t(top.pitch) * bh > top.px.size() || top.pitch < bw * block) return false;
+    px.assign(size_t(img.width) * img.height * 4, 0);
+    for (uint32_t by = 0; by < bh; by++) {
+        for (uint32_t bx = 0; bx < bw; bx++) {
+            const uint8_t* b = &top.px[size_t(by) * top.pitch + size_t(bx) * block];
+            const uint8_t* colour = block == 16 ? b + 8 : b;
+            uint8_t c[4][4];
+            BlockColours(colour, block == 16, c);
+            uint8_t alpha[16];
+            if (img.format == DXGI_FORMAT_BC2_UNORM) {
+                for (int i = 0; i < 16; i++) alpha[i] = uint8_t(((b[i / 2] >> ((i & 1) * 4)) & 15) * 17);
+            } else if (img.format == DXGI_FORMAT_BC3_UNORM) {
+                uint8_t a[8] = {b[0], b[1]};
+                for (int i = 2; i < 8; i++)
+                    a[i] = b[0] > b[1] ? uint8_t(((8 - i) * b[0] + (i - 1) * b[1]) / 7)
+                         : i < 6       ? uint8_t(((6 - i) * b[0] + (i - 1) * b[1]) / 5)
+                                       : uint8_t(i == 6 ? 0 : 255);
+                uint64_t bits = 0;
+                for (int i = 0; i < 6; i++) bits |= uint64_t(b[2 + i]) << (8 * i);
+                for (int i = 0; i < 16; i++) alpha[i] = a[(bits >> (3 * i)) & 7];
+            }
+            uint32_t idx = uint32_t(colour[4] | colour[5] << 8 | colour[6] << 16 | uint32_t(colour[7]) << 24);
+            for (int i = 0; i < 16; i++) {
+                uint32_t x = bx * 4 + uint32_t(i % 4), y = by * 4 + uint32_t(i / 4);
+                if (x >= img.width || y >= img.height) continue;
+                uint8_t* o = &px[(size_t(y) * img.width + x) * 4];
+                std::memcpy(o, c[(idx >> (2 * i)) & 3], 4);
+                if (block == 16) o[3] = alpha[i];
+            }
+        }
+    }
+    return true;
+}
+
+// level 0 as BGRA rows packed
+bool LevelZeroBgra(const Image& img, std::vector<uint8_t>& px) {
+    const Level& top = img.levels[0];
+    if (!Uncompressed(img.format)) return DecodeBc(img, px);
+    px.resize(size_t(img.width) * img.height * 4);
+    for (uint32_t y = 0; y < img.height; y++)
+        std::memcpy(&px[size_t(y) * img.width * 4], &top.px[size_t(y) * top.pitch], size_t(img.width) * 4);
+    if (img.format == DXGI_FORMAT_R8G8B8A8_UNORM)
+        for (size_t i = 0; i < px.size(); i += 4) std::swap(px[i], px[i + 2]);
+    return true;
+}
+
+void WritePng(const fs::path& path, const Image& img) {
+    std::error_code ec;
+    if (fs::exists(path, ec)) return;
+    std::vector<uint8_t> px;
+    SDL_Surface* s = nullptr;
+    if (LevelZeroBgra(img, px))
+        s = SDL_CreateSurfaceFrom(int(img.width), int(img.height), SDL_PIXELFORMAT_BGRA32, px.data(), int(img.width * 4));
+    if (!s || !SDL_SavePNG(s, Utf8(path).c_str())) LOGE("texture dump: %s not written", Utf8(path).c_str());
+    SDL_DestroySurface(s);
+}
+#endif
 
 }  // namespace
 
@@ -413,6 +535,7 @@ void WriteBgraPng(const fs::path& path, uint32_t width, uint32_t height, const s
 
 namespace {
 
+#ifdef _WIN32
 bool ReadPng(const fs::path& path, Image& img) {
     IWICImagingFactory* wic = Wic();
     ComPtr<IWICBitmapDecoder> decoder;
@@ -437,6 +560,26 @@ bool ReadPng(const fs::path& path, Image& img) {
     img.levels.push_back(std::move(top));
     return true;
 }
+#else
+bool ReadPng(const fs::path& path, Image& img) {
+    SDL_Surface* loaded = SDL_LoadPNG(Utf8(path).c_str());
+    SDL_Surface* s = loaded ? SDL_ConvertSurface(loaded, SDL_PIXELFORMAT_BGRA32) : nullptr;
+    SDL_DestroySurface(loaded);
+    bool ok = s && s->w > 0 && s->h > 0 && uint32_t(s->w) <= kMaxSide && uint32_t(s->h) <= kMaxSide;
+    if (ok) {
+        uint32_t w = uint32_t(s->w), h = uint32_t(s->h);
+        Level top{std::vector<uint8_t>(size_t(w) * h * 4), w * 4};
+        for (uint32_t y = 0; y < h; y++)
+            std::memcpy(&top.px[size_t(y) * w * 4], static_cast<const uint8_t*>(s->pixels) + size_t(y) * s->pitch, w * 4);
+        img.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        img.width = w;
+        img.height = h;
+        img.levels.push_back(std::move(top));
+    }
+    SDL_DestroySurface(s);
+    return ok;
+}
+#endif
 
 // Mipmaps
 
@@ -475,7 +618,7 @@ void AddMipmaps(Image& img) {
 
 void Load(uint64_t key, const fs::path& path, uint32_t revision) {
     Image img;
-    bool dds = _wcsicmp(path.extension().c_str(), L".dds") == 0;
+    bool dds = HasExtension(path, L".dds");
     bool ok = dds ? ReadDds(path, img) : ReadPng(path, img);
     // a BC texture's top level is whole blocks
     if (ok && !Uncompressed(img.format) && ((img.width | img.height) & 3)) ok = false;
@@ -529,6 +672,7 @@ bool LatchSettings() {
 
 // the pack folder's change handle, tried again now and then while the folder is missing; once made the pack is
 // listed at once
+#ifdef _WIN32
 void EnsureWatch() {
     if (g.watch != INVALID_HANDLE_VALUE || g.watch_tries++ % kWatchRetry) return;
     g.watch = FindFirstChangeNotificationW(g.pack_dir.c_str(), TRUE, kPackChanges);
@@ -542,6 +686,42 @@ void NoteFolderChange(Clock::time_point now) {
     FindCloseChangeNotification(g.watch);  // the folder went away
     g.watch = INVALID_HANDLE_VALUE;
 }
+#else
+// the pack folder's files: how many and the newest write; polled every kWatchRetry presents
+uint64_t PackSignature() {
+    uint64_t sig = 1469598103934665603ull;
+    std::error_code ec;
+    fs::recursive_directory_iterator it(g.pack_dir, ec);
+    for (; !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+        uint64_t t = uint64_t(it->last_write_time(ec).time_since_epoch().count());
+        uint64_t size = it->is_regular_file(ec) ? it->file_size(ec) : 0;
+        sig = (sig ^ t ^ (size << 1)) * 1099511628211ull;
+    }
+    return sig;
+}
+
+void EnsureWatch() {
+    if (g.watch || g.watch_tries++ % kWatchRetry) return;
+    std::error_code ec;
+    if (!fs::is_directory(g.pack_dir, ec)) return;
+    g.watch = true;
+    g.watch_sig = PackSignature();
+    g.changed = Clock::time_point{};
+}
+
+void NoteFolderChange(Clock::time_point now) {
+    if (!g.watch || g.watch_tries++ % kWatchRetry) return;
+    std::error_code ec;
+    if (!fs::is_directory(g.pack_dir, ec)) {
+        g.watch = false;  // the folder went away
+        return;
+    }
+    uint64_t sig = PackSignature();
+    if (sig == g.watch_sig) return;
+    g.watch_sig = sig;
+    g.changed = now;
+}
+#endif
 
 // UI upscaling
 
@@ -784,12 +964,17 @@ bool Edit(uint64_t key, const TextureDesc& d, const uint8_t* guest, const uint32
     TextureDesc top = d;
     top.levels = 1;
     Post([key, revision, ui, game, img = Decode(top, guest, palette)] {
+#ifdef _WIN32
         IWICImagingFactory* wic = Wic();
         std::vector<uint8_t> dds;
         ComPtr<IWICBitmapSource> src;
         std::vector<uint8_t> px(size_t(img.width) * img.height * 4);
         bool ok = wic && SUCCEEDED(LevelZeroBitmap(wic, img, dds, src)) &&
                   SUCCEEDED(src->CopyPixels(nullptr, img.width * 4, UINT(px.size()), px.data()));
+#else
+        std::vector<uint8_t> px;
+        bool ok = LevelZeroBgra(img, px);
+#endif
         uint32_t w = img.width, h = img.height;
         uint32_t sw = w, sh = h;
         bool upscaled = ok && ui && UpscaleFlat(px, w, h);

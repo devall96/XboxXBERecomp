@@ -2,6 +2,8 @@
 // xbe of GameInfo::images to C++, clang compiles that and lld links it into <exe>.dll beside the executables, all from
 // the compiler folder. The first start does this behind a progress window. Finished objects are kept, so a closed window
 // or a crash loses only the files in progress and the next start carries on.
+// Linux: lib<exe>.so, built the same way with clang and ld.lld; the progress shows in the log for now.
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -10,6 +12,21 @@
 #endif
 #include <windows.h>
 #include <xinput.h>
+#else
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/file.h>
+#include <sys/prctl.h>
+#include <sys/resource.h>
+#include <sys/statvfs.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <map>
+#include <mutex>
+
+#include "core/platform.h"
+#endif
 
 #include <algorithm>
 #include <cstdlib>
@@ -48,20 +65,32 @@ struct Image {
     fs::path config;
 };
 
+#ifdef _WIN32
 // as CMakePresets.json and CMakeLists.txt compile it for build.bat
 constexpr wchar_t kClangFlags[] =
     L"-target x86_64-pc-windows-msvc -fms-compatibility-version=19.40 -std=c++20 -O2 -march=x86-64-v2 "
     L"-fno-strict-aliasing -DNDEBUG -DX86_GAME_CODE -nostdinc -nostdinc++ -w";
 constexpr wchar_t kLinkFlags[] = L"/dll /noentry /nodefaultlib /machine:x64 /opt:noicf";
+constexpr wchar_t kExeSuffix[] = L".exe";
+constexpr char kObject[] = ".obj";
+#else
+// as CMakePresets.json and sdk/cmake/XbeRecomp.cmake compile it on Linux
+const char* const kClangFlags[] = {"-target", "x86_64-pc-linux-gnu", "-std=c++20", "-O2", "-march=x86-64-v2", "-fPIC",
+                                   "-fno-strict-aliasing", "-DNDEBUG", "-DX86_GAME_CODE", "-nostdinc", "-nostdinc++", "-w"};
+constexpr wchar_t kExeSuffix[] = L"";
+constexpr char kObject[] = ".o";
+#endif
 constexpr uint64_t kJobMemory = 512ull << 20;  // a compiler's peak on the biggest file is about half of this
 constexpr uint64_t kDiskNeeded = 1ull << 30;    // both images' sources, objects and DLLs, with room to spare
 
+#ifdef _WIN32
 // the window's colours
 constexpr COLORREF kBackground = RGB(10, 11, 10);
 constexpr COLORREF kText = RGB(227, 232, 219);
 constexpr COLORREF kDim = RGB(145, 153, 138);
 constexpr COLORREF kBarEmpty = RGB(28, 33, 26);
 constexpr COLORREF kBarFull = RGB(145, 158, 130);
+#endif
 
 enum class Stage { Translating, Compiling, Linking, Ready };
 
@@ -79,11 +108,13 @@ struct Progress {
 
 Progress g_progress;
 std::wstring g_failure;  // the step that failed, written by the build thread before it ends
+#ifdef _WIN32
 HWND g_window = nullptr;
 bool g_start = false;  // the player picked Start once the game was ready
 bool g_delete_compiler = false;  // ticked on the ready page
 uint64_t g_compiler_bytes = 0;
 constexpr UINT kBuildDone = WM_APP + 1;
+#endif
 
 int64_t NowMs() {
     using namespace std::chrono;
@@ -126,7 +157,12 @@ std::vector<Image> Images() {
 }
 
 fs::path WorkDir(const Image& image) { return CompilerDir() / "work" / image.exe; }
+#ifdef _WIN32
 fs::path CodeDll(const Image& image) { return ExeDir() / (image.exe + L".dll"); }
+#else
+fs::path CodeDll(const Image& image) { return ExeDir() / (L"lib" + image.exe + L".so"); }
+#endif
+fs::path ExeFile(const Image& image) { return ExeDir() / (image.exe + kExeSuffix); }
 fs::path StampFile(const Image& image) { return WorkDir(image) / "built.txt"; }
 std::wstring Quote(const fs::path& path) { return L"\"" + path.wstring() + L"\""; }
 fs::path CompileLog() { return DataDir() / "logs" / "compile.log"; }
@@ -146,6 +182,7 @@ struct Target {
 };
 
 // a DLL serves the executable it was linked against and the xbe it was translated from
+#ifdef _WIN32
 bool StampFor(const Image& image, const std::vector<uint8_t>& xbe, std::string& stamp) {
     WIN32_FILE_ATTRIBUTE_DATA exe{};
     fs::path path = ExeDir() / (image.exe + L".exe");
@@ -155,6 +192,17 @@ bool StampFor(const Image& image, const std::vector<uint8_t>& xbe, std::string& 
     stamp = std::to_string(size) + " " + std::to_string(time) + " " + Sha1(xbe);
     return true;
 }
+#else
+bool StampFor(const Image& image, const std::vector<uint8_t>& xbe, std::string& stamp) {
+    std::error_code ec;
+    uint64_t size = fs::file_size(ExeFile(image), ec);
+    if (ec) return false;
+    auto time = fs::last_write_time(ExeFile(image), ec).time_since_epoch().count();
+    if (ec) return false;
+    stamp = std::to_string(size) + " " + std::to_string(time) + " " + Sha1(xbe);
+    return true;
+}
+#endif
 
 // build.bat's DLL has no stamp: it is current when newer than the executable it was linked against and the game is
 // the release it was built from
@@ -164,7 +212,7 @@ bool Current(const Target& target) {
     if (ec) return false;
     std::ifstream f(StampFile(*target.image));
     bool built_release = target.image->xbe != IMAGE_XBE || Sha1(target.xbe) == kImageSha1;
-    if (!f) return built_release && built > fs::last_write_time(ExeDir() / (target.image->exe + L".exe"), ec);
+    if (!f) return built_release && built > fs::last_write_time(ExeFile(*target.image), ec);
     std::string line;
     return std::getline(f, line) && line == target.stamp;
 }
@@ -215,11 +263,31 @@ uint32_t PartitionCount(const Image& image) {
     }
 }
 
+#ifdef _WIN32
+fs::path Tool(const wchar_t* name) { return CompilerDir() / (std::wstring(name) + L".exe"); }
+#else
+// the compiler folder's own, else (a development build) the system's
+fs::path Tool(const wchar_t* name) {
+    std::error_code ec;
+    fs::path own = CompilerDir() / name;
+    if (fs::exists(own, ec)) return own;
+    std::string path = platform::Utf8(platform::Env(L"PATH"));
+    for (size_t at = 0; at <= path.size();) {
+        size_t end = path.find(':', at);
+        if (end == std::string::npos) end = path.size();
+        fs::path p = fs::path(path.substr(at, end - at)) / name;
+        if (end > at && fs::exists(p, ec)) return p;
+        at = end + 1;
+    }
+    return own;
+}
+#endif
+
 // the newest of what every object of an image is built from besides its own source
 fs::file_time_type SharedInputsTime(const Image& image) {
     std::error_code ec;
     fs::file_time_type newest = fs::last_write_time(WorkDir(image) / "x86_recomp_shared.h", ec);
-    newest = std::max(newest, fs::last_write_time(CompilerDir() / "clang.exe", ec));
+    newest = std::max(newest, fs::last_write_time(Tool(L"clang"), ec));
     for (auto& e : fs::recursive_directory_iterator(CompilerDir() / "include", ec))
         newest = std::max(newest, e.last_write_time(ec));
     return newest;
@@ -232,7 +300,7 @@ void AddJobs(const Image& image, std::vector<Job>& jobs) {
     for (uint32_t i = 0; i < PartitionCount(image); i++) names.push_back("x86_recomp." + std::to_string(i));
     fs::file_time_type shared = SharedInputsTime(image);
     for (const std::string& name : names) {
-        Job job{work / (name + ".cpp"), work / (name + ".obj")};
+        Job job{work / (name + ".cpp"), work / (name + kObject)};
         std::error_code ec;
         job.bytes = fs::file_size(job.source, ec);
         fs::file_time_type built = fs::last_write_time(job.object, ec);
@@ -241,6 +309,7 @@ void AddJobs(const Image& image, std::vector<Job>& jobs) {
     }
 }
 
+#ifdef _WIN32
 // compilers that run at once: one a logical processor, as many as the free memory holds
 size_t Slots() {
     MEMORYSTATUSEX mem{sizeof(mem)};
@@ -417,6 +486,241 @@ bool Link(const Target& target, Processes& run) {
     std::ofstream(StampFile(image)) << target.stamp << "\n";
     return true;
 }
+#else
+// compilers that run at once: one a logical processor, as many as the available memory holds
+size_t Slots() {
+    uint64_t available = 0;
+    std::ifstream meminfo("/proc/meminfo");
+    for (std::string key; meminfo >> key;) {
+        uint64_t kb = 0;
+        meminfo >> kb;
+        if (key == "MemAvailable:") available = kb << 10;
+        meminfo.ignore(64, '\n');
+    }
+    size_t by_memory = available ? size_t(available / kJobMemory) : 4;
+    size_t by_cpu = size_t(std::max(1L, sysconf(_SC_NPROCESSORS_ONLN)));
+    return std::clamp<size_t>(std::min(by_memory, by_cpu), 1, 64);
+}
+
+// starts and waits on the build's processes, each at a lower priority and ended with this one; output to
+// logs/compile.log
+class Processes {
+public:
+    using Handle = pid_t;
+    Processes() {
+        log_ = open(CompileLog().c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    }
+    ~Processes() {
+        if (log_ >= 0) close(log_);
+    }
+
+    // 0 when it did not start
+    Handle Start(const std::vector<std::string>& args, const fs::path& dir) {
+        std::vector<char*> argv;
+        for (const std::string& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+        argv.push_back(nullptr);
+        std::string where = dir.string();
+        pid_t parent = getpid();
+        pid_t pid = fork();
+        if (pid == 0) {
+            // only async-signal-safe calls until exec
+            prctl(PR_SET_PDEATHSIG, SIGKILL);
+            if (getppid() != parent) _exit(127);
+            setpriority(PRIO_PROCESS, 0, 10);
+            if (log_ >= 0) {
+                dup2(log_, 1);
+                dup2(log_, 2);
+            }
+            if (chdir(where.c_str()) != 0) _exit(127);
+            execv(argv[0], argv.data());
+            _exit(127);
+        }
+        if (pid < 0) {
+            LOGE("game code: could not start %s", args[0].c_str());
+            return 0;
+        }
+        std::lock_guard lock(m_);
+        running_.push_back(pid);
+        return pid;
+    }
+
+    // reaps the process; 0 when it exited cleanly
+    int ExitCode(Handle pid) {
+        {
+            std::lock_guard lock(m_);
+            if (auto it = done_.find(pid); it != done_.end()) return it->second;
+        }
+        int status = 0;
+        if (waitpid(pid, &status, 0) != pid) return 1;
+        return Finished(pid, status);
+    }
+    bool Succeeded(Handle pid) { return ExitCode(pid) == 0; }
+
+    // the index of a process that has ended, or -1 after ms without one (or once cancelled)
+    int WaitAny(const std::vector<Handle>& processes, int ms) {
+        for (int waited = 0;; waited += 10) {
+            for (size_t i = 0; i < processes.size(); i++) {
+                {
+                    std::lock_guard lock(m_);
+                    if (done_.count(processes[i])) return int(i);
+                }
+                int status = 0;
+                if (waitpid(processes[i], &status, WNOHANG) == processes[i]) {
+                    Finished(processes[i], status);
+                    return int(i);
+                }
+            }
+            if (waited >= ms || g_progress.cancel) return -1;
+            usleep(10000);
+        }
+    }
+
+    // false when cancelled, which ends every process of the build
+    bool WaitAll(std::vector<Handle>& processes) {
+        for (Handle p : processes) {
+            for (;;) {
+                {
+                    std::lock_guard lock(m_);
+                    if (done_.count(p)) break;
+                }
+                int status = 0;
+                if (waitpid(p, &status, WNOHANG) == p) {
+                    Finished(p, status);
+                    break;
+                }
+                if (g_progress.cancel) return Cancel();
+                usleep(20000);
+            }
+        }
+        return true;
+    }
+
+    bool Cancel() {
+        std::lock_guard lock(m_);
+        for (pid_t p : running_)
+            if (!done_.count(p)) kill(p, SIGKILL);
+        return false;
+    }
+
+private:
+    int Finished(pid_t pid, int status) {
+        int code = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + (WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+        std::lock_guard lock(m_);
+        done_[pid] = code;
+        return code;
+    }
+
+    int log_ = -1;
+    std::mutex m_;
+    std::vector<pid_t> running_;
+    std::map<pid_t, int> done_;
+};
+
+std::string Arg(const fs::path& p) { return p.string(); }
+
+// xbe_recomp writes each image's C++ into its work folder, the images side by side
+bool Translate(std::vector<Target>& targets, Processes& run) {
+    std::vector<Processes::Handle> processes;
+    for (Target& target : targets) {
+        fs::path work = WorkDir(*target.image);
+        fs::path xbe = work / target.image->xbe;
+        std::ofstream(xbe, std::ios::binary).write(reinterpret_cast<const char*>(target.xbe.data()), target.xbe.size());
+        Processes::Handle process = run.Start({Arg(Tool(L"xbe_recomp")), Arg(target.image->config), Arg(xbe), Arg(work),
+                                               "--xdk", Arg(CompilerDir() / "xdk")},
+                                              work);
+        if (!process) return RecordFailure(L"xbe_recomp could not be started.");
+        processes.push_back(process);
+    }
+    if (!run.WaitAll(processes)) return false;
+    bool ok = true;
+    for (size_t i = 0; i < processes.size(); i++) {
+        const std::string& xbe = targets[i].image->xbe;
+        if (run.ExitCode(processes[i])) ok = RecordFailure(L"Translating " + std::wstring(xbe.begin(), xbe.end()) + L" failed.");
+    }
+    return ok;
+}
+
+std::vector<std::string> CompileCommand(const Job& job) {
+    fs::path include = CompilerDir() / "include";
+    std::vector<std::string> args{Arg(Tool(L"clang"))};
+    for (const char* flag : kClangFlags) args.push_back(flag);
+    args.insert(args.end(), {"-isystem", Arg(include / "freestanding"), "-I" + Arg(include), "-c",
+                             job.source.filename().string(), "-o", job.object.filename().string() + ".tmp"});
+    return args;
+}
+
+// an object is written beside its final name and moved there once whole
+bool FinishJob(const Job& job, Processes::Handle process, Processes& run) {
+    std::wstring name = job.source.parent_path().filename().wstring() + L"/" + job.source.filename().wstring();
+    if (!run.Succeeded(process)) return RecordFailure(L"Compiling " + name + L" failed.");
+    fs::path temp = job.object;
+    temp += ".tmp";
+    std::error_code ec;
+    fs::rename(temp, job.object, ec);
+    if (ec) return RecordFailure(L"Saving the compiled " + name + L" failed.");
+    g_progress.bytes_done += job.bytes;
+    g_progress.files_done++;
+    return true;
+}
+
+// the biggest files first, as many at once as Slots allows
+bool Compile(std::vector<Job>& jobs, Processes& run) {
+    std::sort(jobs.begin(), jobs.end(), [](const Job& a, const Job& b) { return a.bytes > b.bytes; });
+    size_t slots = Slots();
+    LOGR("Game code: compiling %zu files, %zu at a time", jobs.size(), slots);
+    for (const Job& job : jobs) g_progress.bytes_total += job.bytes;
+    g_progress.files_total = uint32_t(jobs.size());
+    g_progress.first_wave = uint32_t(std::min(slots, jobs.size()));
+    g_progress.compile_start = NowMs();
+    g_progress.stage = Stage::Compiling;
+
+    std::vector<Processes::Handle> running;
+    std::vector<const Job*> running_jobs;
+    size_t next = 0;
+    uint32_t logged = 0;
+    while (next < jobs.size() || !running.empty()) {
+        for (; running.size() < slots && next < jobs.size(); next++) {
+            Processes::Handle process = run.Start(CompileCommand(jobs[next]), jobs[next].source.parent_path());
+            if (!process) {
+                RecordFailure(L"clang could not be started.");
+                return run.Cancel();
+            }
+            running.push_back(process);
+            running_jobs.push_back(&jobs[next]);
+        }
+        int done = run.WaitAny(running, 250);
+        if (g_progress.cancel) return run.Cancel();
+        if (done < 0) continue;
+        if (!FinishJob(*running_jobs[size_t(done)], running[size_t(done)], run)) return run.Cancel();
+        running.erase(running.begin() + done);
+        running_jobs.erase(running_jobs.begin() + done);
+        // no window yet on Linux: the progress in the log, every tenth
+        uint32_t tenth = g_progress.files_total ? g_progress.files_done * 10 / g_progress.files_total : 10;
+        if (tenth != logged) {
+            logged = tenth;
+            LOGR("Game code: %u of %u files compiled", g_progress.files_done.load(), g_progress.files_total.load());
+        }
+    }
+    return true;
+}
+
+// ld.lld links the objects into lib<exe>.so, whose calls into the runtime resolve against the executable when it is
+// loaded; then the stamp says what it was built from
+bool Link(const Target& target, Processes& run) {
+    const Image& image = *target.image;
+    fs::path work = WorkDir(image);
+    fs::path so = CodeDll(image);
+    std::vector<std::string> args{Arg(Tool(L"ld.lld")), "-shared", "-z", "undefs", "--icf=none", "-soname",
+                                  so.filename().string(), "-o", Arg(so), "x86_func_mapping.o"};
+    for (uint32_t i = 0; i < PartitionCount(image); i++) args.push_back("x86_recomp." + std::to_string(i) + ".o");
+    std::vector<Processes::Handle> process{run.Start(args, work)};
+    if (!process[0]) return RecordFailure(L"ld.lld could not be started.");
+    if (!run.WaitAll(process)) return false;
+    if (!run.Succeeded(process[0])) return RecordFailure(L"Linking " + so.filename().wstring() + L" failed.");
+    std::ofstream(StampFile(image)) << target.stamp << "\n";
+    return true;
+}
+#endif
 
 bool Build(std::vector<Target>& targets) {
     Processes run;
@@ -432,9 +736,14 @@ bool Build(std::vector<Target>& targets) {
 
 // what stops a build before it starts, for the player to fix; empty when nothing does
 std::wstring Blocker(const std::vector<Target>& targets) {
-    for (const wchar_t* tool : {L"clang.exe", L"lld-link.exe", L"xbe_recomp.exe"}) {
+#ifdef _WIN32
+    const wchar_t* tools[] = {L"clang", L"lld-link", L"xbe_recomp"};
+#else
+    const wchar_t* tools[] = {L"clang", L"ld.lld", L"xbe_recomp"};
+#endif
+    for (const wchar_t* tool : tools) {
         std::error_code ec;
-        if (!fs::exists(CompilerDir() / tool, ec))
+        if (!fs::exists(Tool(tool), ec))
             return L"The compiler folder is missing files. Extract the whole release again, then start the game.";
     }
     for (const Target& target : targets) {
@@ -445,9 +754,15 @@ std::wstring Blocker(const std::vector<Target>& targets) {
         if (ec)
             return L"The game's folder cannot be written to. Move it somewhere you can write to, such as Documents.";
     }
+#ifdef _WIN32
     ULARGE_INTEGER free{};
     if (GetDiskFreeSpaceExW(CompilerDir().c_str(), &free, nullptr, nullptr) && free.QuadPart < kDiskNeeded)
         return L"Preparing the game needs 1 GB of free space on the drive it is on.";
+#else
+    struct statvfs fsinfo{};
+    if (statvfs(CompilerDir().c_str(), &fsinfo) == 0 && uint64_t(fsinfo.f_bavail) * fsinfo.f_frsize < kDiskNeeded)
+        return L"Preparing the game needs 1 GB of free space on the drive it is on.";
+#endif
     return {};
 }
 
@@ -489,6 +804,7 @@ float Fraction() {
     }
 }
 
+#ifdef _WIN32
 void DrawLine(HDC dc, RECT row, const std::wstring& text, COLORREF color, UINT align) {
     SetTextColor(dc, color);
     DrawTextW(dc, text.c_str(), int(text.size()), &row, align | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
@@ -753,6 +1069,77 @@ bool BuildWithWindow(std::vector<Target>& targets) {
     if (!ok && !g_progress.cancel) ShowFailure();
     return ok && g_start;
 }
+#else
+// the last lines of logs/compile.log, where a compiler's error is
+std::wstring CompileLogTail() {
+    constexpr size_t kTailBytes = 1500;
+    std::ifstream f(CompileLog(), std::ios::binary | std::ios::ate);
+    if (!f) return {};
+    std::streamoff size = f.tellg();
+    std::streamoff start = size > std::streamoff(kTailBytes) ? size - std::streamoff(kTailBytes) : 0;
+    std::string tail(size_t(size - start), '\0');
+    f.seekg(start);
+    f.read(tail.data(), std::streamsize(tail.size()));
+    if (start) tail.erase(0, tail.find('\n') + 1);
+    return platform::Wide(tail);
+}
+
+// no window yet: the build runs before the game window opens, its progress in the log
+bool BuildWithWindow(std::vector<Target>& targets) {
+    if (std::wstring blocker = Blocker(targets); !blocker.empty()) {
+        platform::Message(kGame.title, blocker, true);
+        return false;
+    }
+    bool ok = Build(targets);
+    if (!ok && !g_progress.cancel) {
+        std::wstring text = L"Preparing the game failed. " + g_failure;
+        if (std::wstring tail = CompileLogTail(); !tail.empty()) text += L"\n\nThe last lines of the log:\n\n" + tail;
+        text += L"\n\nThe full details are in logs/compile.log.";
+        platform::Message(kGame.title, text, true);
+    }
+    return ok;
+}
+#endif
+
+// one build at a time on this PC: a second copy of the game started meanwhile waits for it
+class BuildLock {
+public:
+#ifdef _WIN32
+    BuildLock() {
+        lock_ = CreateMutexW(nullptr, FALSE, (std::wstring(kGame.name) + L"-GameCode").c_str());
+        WaitForSingleObject(lock_, INFINITE);
+    }
+    ~BuildLock() {
+        ReleaseMutex(lock_);
+        CloseHandle(lock_);
+    }
+
+private:
+    HANDLE lock_ = nullptr;
+#else
+    BuildLock() {
+        std::error_code ec;
+        fs::create_directories(CompilerDir(), ec);
+        fd_ = open((CompilerDir() / "build.lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+        if (fd_ >= 0) flock(fd_, LOCK_EX);
+    }
+    ~BuildLock() {
+        if (fd_ >= 0) close(fd_);
+    }
+
+private:
+    int fd_ = -1;
+#endif
+};
+
+// no sleep while the build works
+void KeepAwake(bool on) {
+#ifdef _WIN32
+    SetThreadExecutionState(on ? ES_CONTINUOUS | ES_SYSTEM_REQUIRED : ES_CONTINUOUS);
+#else
+    (void)on;
+#endif
+}
 
 }  // namespace
 
@@ -778,19 +1165,19 @@ bool StartGameCodeBuild() {
         g_headless_ok = false;
         return false;
     }
-    for (const Target& target : stale) LOGR("Game code: building %ls.dll (setup)", target.image->exe.c_str());
+    for (const Target& target : stale) LOGR("Game code: building %ls (setup)", CodeDll(*target.image).filename().wstring().c_str());
     g_headless_running = true;
     g_headless_done = g_headless_ok = false;
     g_progress.cancel = false;
     std::thread([] {
-        HANDLE lock = CreateMutexW(nullptr, FALSE, (std::wstring(kGame.name) + L"-GameCode").c_str());
-        WaitForSingleObject(lock, INFINITE);
-        SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);
-        bool ok = Build(stale);
-        if (ok) g_progress.stage = Stage::Ready;
-        SetThreadExecutionState(ES_CONTINUOUS);
-        ReleaseMutex(lock);
-        CloseHandle(lock);
+        bool ok;
+        {
+            BuildLock lock;
+            KeepAwake(true);
+            ok = Build(stale);
+            if (ok) g_progress.stage = Stage::Ready;
+            KeepAwake(false);
+        }
         g_headless_ok = ok;
         g_headless_done = true;
         g_headless_running = false;
@@ -814,20 +1201,23 @@ void CancelGameCodeBuild() { g_progress.cancel = true; }
 
 bool PrepareGameCode(const GameFiles& game) {
     // one build at a time: a second copy of the game started meanwhile waits for it, then finds the DLL current
-    std::wstring mutex_name = std::wstring(kGame.name) + L"-GameCode";
-    HANDLE lock = CreateMutexW(nullptr, FALSE, mutex_name.c_str());
-    WaitForSingleObject(lock, INFINITE);
     std::vector<Image> images = Images();
-    std::vector<Target> stale = StaleTargets(game, images);
-    for (const Target& target : stale) LOGR("Game code: building %ls.dll", target.image->exe.c_str());
-    bool built = stale.empty() || BuildWithWindow(stale);
-    ReleaseMutex(lock);
-    CloseHandle(lock);
+    bool built;
+    {
+        BuildLock lock;
+        std::vector<Target> stale = StaleTargets(game, images);
+        for (const Target& target : stale) LOGR("Game code: building %ls", CodeDll(*target.image).filename().wstring().c_str());
+        built = stale.empty() || BuildWithWindow(stale);
+    }
     if (!built) return false;
     for (const Image& image : images)
         if (image.xbe == IMAGE_XBE && dispatch::Load(CodeDll(image))) return true;
+#ifdef _WIN32
     MessageBoxW(nullptr, L"The game's code could not be loaded, see the log in the logs folder.", kGame.title,
                 MB_ICONERROR);
+#else
+    platform::Message(kGame.title, L"The game's code could not be loaded, see the log in the logs folder.", true);
+#endif
     return false;
 }
 

@@ -8,8 +8,13 @@
 
 #include "core/log.h"
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 namespace mem {
 
@@ -24,6 +29,7 @@ static bool InPhysical(uint32_t va) {
            (va >= kWriteCombineBase && va < kWriteCombineBase + kPhysicalSize);
 }
 
+#ifdef _WIN32
 bool Init() {
     const uint64_t size = 1ull << 32;
     HANDLE ram = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, kPhysicalSize, nullptr);
@@ -56,6 +62,40 @@ bool Init() {
     LOGI("memory: guest space at %p", static_cast<void*>(g_base));
     return true;
 }
+#else
+// The 4 GB reserved without access or backing; the physical memory a shared file (memfd) mapped into both windows.
+bool Init() {
+    const uint64_t size = 1ull << 32;
+    int ram = memfd_create("guest-ram", MFD_CLOEXEC);
+    if (ram < 0 || ftruncate(ram, kPhysicalSize) != 0) {
+        LOGE("memory: no shared memory for the guest's RAM");
+        return false;
+    }
+    for (uint64_t hint : {0x100000000ull, 0x200000000ull, 0x300000000ull, 0ull}) {
+        int fixed = hint ? MAP_FIXED_NOREPLACE : 0;
+        void* p = mmap(reinterpret_cast<void*>(hint), size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | fixed,
+                       -1, 0);
+        if (p == MAP_FAILED) continue;
+        auto* b = static_cast<uint8_t*>(p);
+        bool ok = mmap(b + kContiguousBase, kPhysicalSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, ram, 0) ==
+                      b + kContiguousBase &&
+                  mmap(b + kWriteCombineBase, kPhysicalSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, ram, 0) ==
+                      b + kWriteCombineBase;
+        if (ok) {
+            g_base = b;
+            break;
+        }
+        munmap(p, size);
+    }
+    close(ram);
+    if (!g_base) {
+        LOGE("memory: could not reserve the 4 GB guest space");
+        return false;
+    }
+    LOGI("memory: guest space at %p", static_cast<void*>(g_base));
+    return true;
+}
+#endif
 
 // page commit map, one byte per 4 KB page
 static std::vector<uint8_t> g_committed(0x100000, 0);
@@ -65,7 +105,12 @@ bool Commit(uint32_t va, uint32_t size) {
     uint32_t first = va & ~(kPage - 1);
     uint64_t end = (uint64_t(va) + size + kPage - 1) & ~uint64_t(kPage - 1);
     std::lock_guard<std::recursive_mutex> lock(g_lock);
-    if (!VirtualAlloc(g_base + first, size_t(end - first), MEM_COMMIT, PAGE_READWRITE)) {
+#ifdef _WIN32
+    bool ok = VirtualAlloc(g_base + first, size_t(end - first), MEM_COMMIT, PAGE_READWRITE) != nullptr;
+#else
+    bool ok = mprotect(g_base + first, size_t(end - first), PROT_READ | PROT_WRITE) == 0;
+#endif
+    if (!ok) {
         LOGE("memory: commit %08X+%X failed", first, uint32_t(end - first));
         return false;
     }
@@ -78,7 +123,12 @@ void Decommit(uint32_t va, uint32_t size) {
     uint32_t first = va & ~(kPage - 1);
     uint64_t end = (uint64_t(va) + size + kPage - 1) & ~uint64_t(kPage - 1);
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+#ifdef _WIN32
     VirtualFree(g_base + first, size_t(end - first), MEM_DECOMMIT);
+#else
+    // a fresh mapping drops the pages: committed again they read zero, as on Windows
+    mmap(g_base + first, size_t(end - first), PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
+#endif
     for (uint64_t p = first; p < end; p += kPage) g_committed[size_t(p >> 12)] = 0;
 }
 

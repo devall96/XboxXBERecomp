@@ -1,5 +1,6 @@
 // The game in assets: its files, or a disc image (.iso) with this executable's xbe on it. The xbe must be the one
 // this executable was recompiled from; another release's would run its own data under this code.
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -7,8 +8,11 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#endif
 
 #include <algorithm>
+
+#include "core/platform.h"
 #include <cstring>
 #include <cwctype>
 #include <fstream>
@@ -123,7 +127,7 @@ bool FindGame(GameFiles& game) {
     }
 
     if (other_name.empty()) {
-        MessageBoxW(nullptr, kGame.missing, kGame.short_title, MB_ICONERROR);
+        platform::Message(kGame.short_title, kGame.missing, true);
         return false;
     }
     if (kGame.one_release) {
@@ -135,13 +139,13 @@ bool FindGame(GameFiles& game) {
                             std::wstring(kImageSha1, kImageSha1 + std::strlen(kImageSha1)) + L"\nFound    " +
                             std::wstring(found.begin(), found.end());
         LOGE("game: %s is another release (sha1 %s), refused", other_name.string().c_str(), found.c_str());
-        MessageBoxW(nullptr, text.c_str(), kGame.short_title, MB_ICONERROR);
+        platform::Message(kGame.short_title, text, true);
         return false;
     }
     std::wstring text = other_name.filename().wstring() +
                         L" is a different release of the game than this build was made from, and will most likely "
                         L"crash.\n\nStart it anyway?";
-    if (MessageBoxW(nullptr, text.c_str(), kGame.short_title, MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) != IDYES) return false;
+    if (!platform::AskYesNo(kGame.short_title, text)) return false;
     game = std::move(other);
     kernel::MountDisc(std::move(other_disc));
     return true;

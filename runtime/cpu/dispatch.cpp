@@ -1,3 +1,4 @@
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -5,6 +6,9 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -20,6 +24,7 @@
 #include "kernel/kernel.h"
 #include "xdk/hle.h"
 
+#ifdef _WIN32
 #include <intrin.h>
 
 // the C runtime functions the game code DLL calls, passed on to the DLLs that have them
@@ -40,6 +45,7 @@
 #pragma comment(linker, "/EXPORT:exp2=ucrtbase.exp2")
 #pragma comment(linker, "/EXPORT:ldexp=ucrtbase.ldexp")
 #pragma comment(linker, "/EXPORT:frexp=ucrtbase.frexp")
+#endif
 
 namespace {
 
@@ -66,17 +72,33 @@ constexpr uint32_t kKernelThunkBase = 0xFE000000;
 namespace dispatch {
 
 // the game code DLL and its tables; data comes by name, as the delay loaded imports carry only functions
+#ifdef _WIN32
+using Module = HMODULE;
+Module Open(const std::filesystem::path& dll) { return LoadLibraryW(dll.c_str()); }
+const void* Symbol(Module m, const char* name) { return reinterpret_cast<const void*>(GetProcAddress(m, name)); }
+#else
+// RTLD_GLOBAL: the executable's weak references to recompiled bodies (X86_EXTERN_FUNC) bind to this library at their
+// first call
+using Module = void*;
+Module Open(const std::filesystem::path& so) {
+    Module m = dlopen(so.c_str(), RTLD_NOW | RTLD_GLOBAL);
+    if (!m) LOGE("dispatch: %s", dlerror());
+    return m;
+}
+const void* Symbol(Module m, const char* name) { return dlsym(m, name); }
+#endif
+
 bool Load(const std::filesystem::path& dll) {
-    HMODULE m = LoadLibraryW(dll.c_str());
+    Module m = Open(dll);
     if (!m) return false;
-    g_mappings = reinterpret_cast<const X86FuncMapping*>(GetProcAddress(m, "X86FuncMappings"));
-    g_continuations = reinterpret_cast<const uint32_t*>(GetProcAddress(m, "X86Continuations"));
-    auto* lo = reinterpret_cast<const uint32_t*>(GetProcAddress(m, "X86CodeBase"));
-    auto* hi = reinterpret_cast<const uint32_t*>(GetProcAddress(m, "X86CodeEnd"));
-    auto* entry = reinterpret_cast<const uint32_t*>(GetProcAddress(m, "X86EntryPoint"));
+    g_mappings = static_cast<const X86FuncMapping*>(Symbol(m, "X86FuncMappings"));
+    g_continuations = static_cast<const uint32_t*>(Symbol(m, "X86Continuations"));
+    auto* lo = static_cast<const uint32_t*>(Symbol(m, "X86CodeBase"));
+    auto* hi = static_cast<const uint32_t*>(Symbol(m, "X86CodeEnd"));
+    auto* entry = static_cast<const uint32_t*>(Symbol(m, "X86EntryPoint"));
     if (!g_mappings || !g_continuations || !lo || !hi || !entry) return false;
 #ifdef IMAGE_NAMED
-    auto* symbols = reinterpret_cast<const X86Symbol*>(GetProcAddress(m, "X86Symbols"));
+    auto* symbols = static_cast<const X86Symbol*>(Symbol(m, "X86Symbols"));
     if (!symbols) return false;
     hle::ResolveSymbols(symbols);
 #endif
@@ -235,7 +257,9 @@ void x86_trap(X86Context& ctx, uint32_t va, const char* what) {
     LOGE("guest trap at %08X: %s", va, what);
     kernel::LogGuestStack(ctx, 64);
     logx::Flush();
+#ifdef _WIN32
     __debugbreak();
+#endif
     std::abort();
 }
 

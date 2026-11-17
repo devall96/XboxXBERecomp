@@ -8,6 +8,8 @@
 // that have reached it. With one peer (co-op) a LAN address in an XNADDR, which only means something on its
 // owner's LAN, stands for the peer's public one: the join address on the client, the address its packets come
 // from on the host. Ports a NAT rewrote are answered on the port the peer's packets came from.
+// Linux: BSD sockets under the same code; the guest still gets Winsock's error numbers, option values and FIONBIO.
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -16,13 +18,142 @@
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/ioctl.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <cerrno>
+#endif
 
 #include <algorithm>
 #include <array>
 #include <random>
 
 #include "app/app.h"
+#include "core/platform.h"
 #include "xdk/hle.h"
+
+#ifndef _WIN32
+namespace {
+using SOCKET = int;
+using DWORD = uint32_t;
+using u_long = unsigned long;
+constexpr SOCKET INVALID_SOCKET = -1;
+
+// Winsock's numbers, which the guest reads
+enum : int {
+    WSAEINTR = 10004, WSAEBADF = 10009, WSAEACCES = 10013, WSAEFAULT = 10014, WSAEINVAL = 10022, WSAEMFILE = 10024,
+    WSAEWOULDBLOCK = 10035, WSAEINPROGRESS = 10036, WSAEALREADY = 10037, WSAENOTSOCK = 10038,
+    WSAEDESTADDRREQ = 10039, WSAEMSGSIZE = 10040, WSAEPROTOTYPE = 10041, WSAENOPROTOOPT = 10042,
+    WSAEPROTONOSUPPORT = 10043, WSAESOCKTNOSUPPORT = 10044, WSAEOPNOTSUPP = 10045, WSAEAFNOSUPPORT = 10047,
+    WSAEADDRINUSE = 10048, WSAEADDRNOTAVAIL = 10049, WSAENETDOWN = 10050, WSAENETUNREACH = 10051,
+    WSAENETRESET = 10052, WSAECONNABORTED = 10053, WSAECONNRESET = 10054, WSAENOBUFS = 10055, WSAEISCONN = 10056,
+    WSAENOTCONN = 10057, WSAESHUTDOWN = 10058, WSAETIMEDOUT = 10060, WSAECONNREFUSED = 10061,
+    WSAEHOSTUNREACH = 10065, WSAHOST_NOT_FOUND = 11001,
+    WSA_OPERATION_ABORTED = 995, WSA_IO_INCOMPLETE = 996, WSA_IO_PENDING = 997,
+};
+constexpr uint32_t kWsaFionbio = 0x8004667E, kWsaFionread = 0x4004667F;
+
+int WSAGetLastError() {
+    switch (errno) {
+        case EAGAIN: return WSAEWOULDBLOCK;
+        case EINPROGRESS: return WSAEWOULDBLOCK;  // a nonblocking connect, as Winsock reports it
+        case EINTR: return WSAEINTR;
+        case EBADF: return WSAENOTSOCK;
+        case EACCES: return WSAEACCES;
+        case EFAULT: return WSAEFAULT;
+        case EINVAL: return WSAEINVAL;
+        case EMFILE: return WSAEMFILE;
+        case EALREADY: return WSAEALREADY;
+        case ENOTSOCK: return WSAENOTSOCK;
+        case EDESTADDRREQ: return WSAEDESTADDRREQ;
+        case EMSGSIZE: return WSAEMSGSIZE;
+        case EPROTOTYPE: return WSAEPROTOTYPE;
+        case ENOPROTOOPT: return WSAENOPROTOOPT;
+        case EPROTONOSUPPORT: return WSAEPROTONOSUPPORT;
+        case EOPNOTSUPP: return WSAEOPNOTSUPP;
+        case EAFNOSUPPORT: return WSAEAFNOSUPPORT;
+        case EADDRINUSE: return WSAEADDRINUSE;
+        case EADDRNOTAVAIL: return WSAEADDRNOTAVAIL;
+        case ENETDOWN: return WSAENETDOWN;
+        case ENETUNREACH: return WSAENETUNREACH;
+        case ENETRESET: return WSAENETRESET;
+        case ECONNABORTED: return WSAECONNABORTED;
+        case ECONNRESET: return WSAECONNRESET;
+        case ECONNREFUSED: return WSAECONNRESET;  // a port unreachable reply on UDP, Winsock's WSAECONNRESET
+        case ENOBUFS: return WSAENOBUFS;
+        case EISCONN: return WSAEISCONN;
+        case ENOTCONN: return WSAENOTCONN;
+        case ESHUTDOWN: return WSAESHUTDOWN;
+        case ETIMEDOUT: return WSAETIMEDOUT;
+        case EHOSTUNREACH: return WSAEHOSTUNREACH;
+        default: return WSAEINVAL;
+    }
+}
+
+int closesocket(SOCKET s) { return close(s); }
+
+// FIONBIO and FIONREAD in Winsock's numbering (the guest's) or the host's
+int ioctlsocket(SOCKET s, long cmd, u_long* v) {
+    if (uint32_t(cmd) == kWsaFionbio || cmd == long(FIONBIO)) {
+        int flags = fcntl(s, F_GETFL, 0);
+        return fcntl(s, F_SETFL, *v ? flags | O_NONBLOCK : flags & ~O_NONBLOCK);
+    }
+    if (uint32_t(cmd) == kWsaFionread || cmd == long(FIONREAD)) {
+        int n = 0;
+        int r = ioctl(s, FIONREAD, &n);
+        *v = u_long(n);
+        return r;
+    }
+    errno = EINVAL;
+    return -1;
+}
+
+// a Winsock socket option as the host's; false for one it has no counterpart of
+bool HostOption(int& level, int& name) {
+    if (level == 0xFFFF) {  // SOL_SOCKET
+        level = SOL_SOCKET;
+        switch (name) {
+            case 0x0004: name = SO_REUSEADDR; return true;
+            case 0x0008: name = SO_KEEPALIVE; return true;
+            case 0x0020: name = SO_BROADCAST; return true;
+            case 0x0080: name = SO_LINGER; return true;
+            case 0x1001: name = SO_SNDBUF; return true;
+            case 0x1002: name = SO_RCVBUF; return true;
+            case 0x1005: name = SO_SNDTIMEO; return false;  // a DWORD of ms in Winsock, a timeval here
+            case 0x1006: name = SO_RCVTIMEO; return false;
+            case 0x1007: name = SO_ERROR; return true;
+            case 0x1008: name = SO_TYPE; return true;
+            default: return false;
+        }
+    }
+    if (level == IPPROTO_TCP) return name == 0x0001 && (name = TCP_NODELAY, true);
+    if (level == IPPROTO_IP) {
+        switch (name) {
+            case 4: name = IP_TTL; return true;          // Winsock's IP_TTL
+            case 9: name = IP_MULTICAST_IF; return true;
+            case 10: name = IP_MULTICAST_TTL; return true;
+            case 11: name = IP_MULTICAST_LOOP; return true;
+            case 12: name = IP_ADD_MEMBERSHIP; return true;
+            case 13: name = IP_DROP_MEMBERSHIP; return true;
+            default: return false;
+        }
+    }
+    return false;
+}
+}  // namespace
+#else
+namespace {
+bool HostOption(int&, int&) { return true; }
+}  // namespace
+#endif
 
 using kernel::HostPtr;
 using kernel::R32;
@@ -136,7 +267,7 @@ uint32_t PrimaryAddress() {
     to.sin_port = htons(53);
     to.sin_addr.s_addr = htonl(0x08080808);  // no packet is sent: connect only picks the route
     sockaddr_in me{};
-    int len = sizeof(me);
+    socklen_t len = sizeof(me);
     if (s != INVALID_SOCKET && ::connect(s, reinterpret_cast<sockaddr*>(&to), sizeof(to)) == 0 &&
         ::getsockname(s, reinterpret_cast<sockaddr*>(&me), &len) == 0 && me.sin_addr.s_addr)
         addr = me.sin_addr.s_addr;
@@ -148,8 +279,10 @@ void Pump();
 
 void Init() {
     std::call_once(g_init, [] {
+#ifdef _WIN32
         WSADATA wsa;
         WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
         g_instance = app::Instance();
         g_local = g_instance ? htonl(0x7F000000u | uint32_t(g_instance)) : PrimaryAddress();
         LOGI("xnet: %s address %s", g_instance ? "loopback instance" : "LAN", Ip(g_local).c_str());
@@ -188,7 +321,7 @@ bool Wait(SOCKET s, bool write, int ms) {
     FD_ZERO(&f);
     FD_SET(s, &f);
     timeval tv{ms / 1000, (ms % 1000) * 1000};
-    return ::select(0, write ? nullptr : &f, write ? &f : nullptr, nullptr, &tv) > 0;
+    return ::select(int(s) + 1, write ? nullptr : &f, write ? &f : nullptr, nullptr, &tv) > 0;
 }
 
 std::vector<Span> Spans(uint32_t bufs, uint32_t count) {
@@ -201,7 +334,7 @@ std::vector<Span> Spans(uint32_t bufs, uint32_t count) {
 int Recv(uint32_t sock, SOCKET s, const std::vector<Span>& spans, uint32_t from, uint32_t fromlen, int& err) {
     thread_local std::vector<uint8_t> buf(65536);
     sockaddr_in src{};
-    int sl = sizeof(src);
+    socklen_t sl = sizeof(src);
     int n = ::recvfrom(s, reinterpret_cast<char*>(buf.data()), int(buf.size()), 0, reinterpret_cast<sockaddr*>(&src), &sl);
     if (n < 0) {
         err = HostError();
@@ -305,20 +438,27 @@ void Pump() {
     for (;;) {
         fd_set set;
         FD_ZERO(&set);
+        int count = 0, width = 0;
         {
             std::lock_guard<std::mutex> lock(g_lock);
             for (auto& p : g_pending) {
                 auto it = g_sockets.find(p.sock);
-                if (it != g_sockets.end() && set.fd_count < FD_SETSIZE) FD_SET(it->second.s, &set);
+                if (it == g_sockets.end() || count >= FD_SETSIZE) continue;
+#ifndef _WIN32
+                if (it->second.s >= FD_SETSIZE) continue;
+#endif
+                FD_SET(it->second.s, &set);
+                count++;
+                width = std::max(width, int(it->second.s) + 1);
             }
         }
-        if (!set.fd_count) {
-            Sleep(1);
+        if (!count) {
+            platform::SleepMs(1);
             continue;
         }
         timeval tv{0, 2000};
-        if (::select(0, &set, nullptr, nullptr, &tv) <= 0) {
-            Sleep(1);
+        if (::select(width, &set, nullptr, nullptr, &tv) <= 0) {
+            platform::SleepMs(1);
             continue;
         }
         std::lock_guard<std::mutex> lock(g_lock);
@@ -462,11 +602,13 @@ HLE_STDCALL(XNetDnsRelease, 1) {
 static uint32_t AddSocket(SOCKET s, bool udp) {
     u_long on = 1;
     ::ioctlsocket(s, FIONBIO, &on);
+#ifdef _WIN32
     if (udp) {
         BOOL off = FALSE;
         DWORD ret = 0;
         WSAIoctl(s, kUdpConnReset, &off, sizeof(off), nullptr, 0, &ret, nullptr, nullptr);
     }
+#endif
     std::lock_guard<std::mutex> lock(g_lock);
     uint32_t id = g_next_socket;
     g_next_socket += 4;
@@ -507,7 +649,11 @@ HLE_STDCALL(ioctlsocket, 3) {
     std::lock_guard<std::mutex> lock(g_lock);
     auto it = g_sockets.find(a[0]);
     if (it == g_sockets.end()) return Fail(WSAENOTSOCK);
+#ifdef _WIN32
     if (a[1] == uint32_t(FIONBIO)) {
+#else
+    if (a[1] == kWsaFionbio) {
+#endif
         it->second.nonblocking = R32(a[2]) != 0;
         return 0;
     }
@@ -519,15 +665,20 @@ HLE_STDCALL(ioctlsocket, 3) {
 HLE_STDCALL(setsockopt, 5) {
     Socket k = Find(a[0]);
     if (k.s == INVALID_SOCKET) return Fail(WSAENOTSOCK);
-    if (::setsockopt(k.s, int(a[1]), int(a[2]), static_cast<const char*>(HostPtr(a[3])), int(a[4])) == 0) return 0;
+    int level = int(a[1]), name = int(a[2]);
+    if (HostOption(level, name) &&
+        ::setsockopt(k.s, level, name, static_cast<const char*>(HostPtr(a[3])), socklen_t(a[4])) == 0)
+        return 0;
     LOG_FIRST(10, "xnet: setsockopt %X level %X option %X ignored (%d)", a[0], a[1], a[2], WSAGetLastError());
     return 0;
 }
 HLE_STDCALL(getsockopt, 5) {
     Socket k = Find(a[0]);
     if (k.s == INVALID_SOCKET) return Fail(WSAENOTSOCK);
-    int len = int(R32(a[4]));
-    if (::getsockopt(k.s, int(a[1]), int(a[2]), static_cast<char*>(HostPtr(a[3])), &len) != 0) return Fail(WSAGetLastError());
+    socklen_t len = socklen_t(R32(a[4]));
+    int level = int(a[1]), name = int(a[2]);
+    if (!HostOption(level, name)) return Fail(WSAENOPROTOOPT);
+    if (::getsockopt(k.s, level, name, static_cast<char*>(HostPtr(a[3])), &len) != 0) return Fail(WSAGetLastError());
     W32(a[4], uint32_t(len));
     return 0;
 }
@@ -535,7 +686,7 @@ HLE_STDCALL(getsockname, 3) {
     Socket k = Find(a[0]);
     if (k.s == INVALID_SOCKET) return Fail(WSAENOTSOCK);
     sockaddr_in me{};
-    int len = sizeof(me);
+    socklen_t len = sizeof(me);
     if (::getsockname(k.s, reinterpret_cast<sockaddr*>(&me), &len) != 0) return Fail(HostError());
     std::memcpy(HostPtr(a[1]), &me, sizeof(me));
     W32(a[2], sizeof(me));
@@ -553,7 +704,7 @@ HLE_STDCALL(bind, 3) {
     }
     LOGI("xnet: bind %X to %s", a[0], Addr(at).c_str());
     sockaddr_in me{};
-    int len = sizeof(me);
+    socklen_t len = sizeof(me);
     ::getsockname(k.s, reinterpret_cast<sockaddr*>(&me), &len);
     std::lock_guard<std::mutex> lock(g_lock);
     if (auto it = g_sockets.find(a[0]); it != g_sockets.end()) it->second.port = me.sin_port;
@@ -567,8 +718,15 @@ HLE_STDCALL(connect, 3) {
     int e = HostError();
     if (e != WSAEWOULDBLOCK || k.nonblocking) return Fail(e);
     if (!Wait(k.s, true, 10000)) return Fail(WSAETIMEDOUT);
-    int err = 0, len = sizeof(err);
+    int err = 0;
+    socklen_t len = sizeof(err);
     ::getsockopt(k.s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &len);
+#ifndef _WIN32
+    if (err) {
+        errno = err;
+        err = WSAGetLastError();
+    }
+#endif
     return err ? Fail(err) : 0;
 }
 HLE_STDCALL(listen, 2) {
@@ -581,7 +739,7 @@ HLE_STDCALL(accept, 3) {
         Socket k = Find(a[0]);
         if (k.s == INVALID_SOCKET) return Fail(WSAENOTSOCK);
         sockaddr_in from{};
-        int len = sizeof(from);
+        socklen_t len = sizeof(from);
         SOCKET s = ::accept(k.s, reinterpret_cast<sockaddr*>(&from), &len);
         if (s != INVALID_SOCKET) {
             if (a[1]) std::memcpy(HostPtr(a[1]), &from, sizeof(from));
@@ -602,6 +760,7 @@ HLE_STDCALL(select, 5) {
     fd_set host[3];
     std::vector<std::pair<uint32_t, SOCKET>> used[3];
     int total = 0;
+    int width = 0;  // the highest descriptor + 1, which Linux needs and Windows ignores
     for (int i = 0; i < 3; i++) {
         FD_ZERO(&host[i]);
         if (!guest[i]) continue;
@@ -611,6 +770,7 @@ HLE_STDCALL(select, 5) {
             Socket k = Find(id);
             if (k.s == INVALID_SOCKET) continue;
             FD_SET(k.s, &host[i]);
+            width = std::max(width, int(k.s) + 1);
             used[i].push_back({id, k.s});
             total++;
         }
@@ -624,9 +784,9 @@ HLE_STDCALL(select, 5) {
     }
     int r = 0;
     if (!total) {
-        if (ptv) Sleep(DWORD(tv.tv_sec * 1000 + tv.tv_usec / 1000));
+        if (ptv) platform::SleepMs(uint32_t(tv.tv_sec * 1000 + tv.tv_usec / 1000));
     } else {
-        r = ::select(0, guest[0] ? &host[0] : nullptr, guest[1] ? &host[1] : nullptr, guest[2] ? &host[2] : nullptr, ptv);
+        r = ::select(width, guest[0] ? &host[0] : nullptr, guest[1] ? &host[1] : nullptr, guest[2] ? &host[2] : nullptr, ptv);
         if (r < 0) return Fail(HostError());
     }
     for (int i = 0; i < 3; i++) {
@@ -763,7 +923,7 @@ HLE_STDCALL(WSAGetOverlappedResult, 5) {
             t_error = WSA_IO_INCOMPLETE;
             return 0;
         }
-        Sleep(1);
+        platform::SleepMs(1);
     }
 }
 HLE_STDCALL(WSACancelOverlappedIO, 1) {
