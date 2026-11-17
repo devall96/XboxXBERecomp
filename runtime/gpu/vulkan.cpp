@@ -22,6 +22,9 @@
 #ifndef _WIN32
 #include <SDL3/SDL_vulkan.h>
 #include <SDL3/SDL_video.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #endif
 
 #include <algorithm>
@@ -2305,6 +2308,12 @@ void VulkanBackend::StartPipelineWorkers() {
     for (uint32_t i = 0; i < threads; i++) {
         std::thread([this, keys, next, made, left, start, threads] {
             platform::NameThread("pipelines");
+            // below the game's threads, as d3d12.cpp's workers: the driver's compiles take what the game leaves
+#ifdef _WIN32
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#else
+            setpriority(PRIO_PROCESS, pid_t(syscall(SYS_gettid)), 10);
+#endif
             for (size_t j; (j = next->fetch_add(1)) < keys->size();) {
                 const PsoKey& k = (*keys)[j];
                 if (k.topo == uint32_t(Topology::Points)) continue;
