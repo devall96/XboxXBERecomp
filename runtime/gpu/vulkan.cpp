@@ -135,6 +135,7 @@ void UiNewFrame() {
 using PerfClock = std::chrono::steady_clock;
 double PerfMs(PerfClock::time_point t) { return std::chrono::duration<double, std::milli>(PerfClock::now() - t).count(); }
 struct Perf {
+    double gpu = 0;  // the GPU's time from a frame's first command to its present's (timestamps)
     double draw = 0, assemble = 0, bind = 0, sig = 0, texup = 0, compile = 0, clear = 0, copy = 0, present = 0,
            wait = 0, swap = 0, sync = 0;
     uint64_t draws = 0, verts = 0, upload = 0, overflow = 0, sigs = 0, sig_bytes = 0, texups = 0, texup_bytes = 0,
@@ -1019,6 +1020,10 @@ private:
         uint64_t fence;
     };
     VkQueryPool query_pool_ = VK_NULL_HANDLE;
+    // per frame slot, two timestamps: the frame's first command and its present's; read once the slot comes round
+    VkQueryPool ts_pool_ = VK_NULL_HANDLE;
+    bool ts_written_[kFrames] = {};
+    void FrameTimestamp(bool end);
     bool queries_failed_ = false;
     uint32_t query_next_ = 0;
     std::vector<Query> counted_;
@@ -1174,6 +1179,12 @@ bool VulkanBackend::CreateDevice() {
     vkCreateSemaphore(dev_, &sci, nullptr, &timeline_);
     VkPipelineCacheCreateInfo pci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
     vkCreatePipelineCache(dev_, &pci, nullptr, &pcache_);
+    if (props_.limits.timestampComputeAndGraphics) {
+        VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qi.queryCount = 2 * kFrames;
+        vkCreateQueryPool(dev_, &qi, nullptr, &ts_pool_);
+    }
     return true;
 }
 
@@ -4056,6 +4067,24 @@ void VulkanBackend::ResetFrame() {
     f.garbage_buffers.clear();
     f.used = 0;
     Begin();
+    FrameTimestamp(false);
+}
+
+// end false: the slot's last frame's GPU time into g_perf.gpu (its fence has passed), then this frame's start
+void VulkanBackend::FrameTimestamp(bool end) {
+    if (!ts_pool_ || !diag::Perf()) return;
+    uint32_t slot = uint32_t(frame_ % kFrames) * 2;
+    if (end) {
+        vkCmdWriteTimestamp2(cb_, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, ts_pool_, slot + 1);
+        return;
+    }
+    uint64_t t[2] = {};
+    if (ts_written_[frame_ % kFrames] &&
+        vkGetQueryPoolResults(dev_, ts_pool_, slot, 2, sizeof(t), t, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+        g_perf.gpu += double(t[1] - t[0]) * props_.limits.timestampPeriod / 1e6;
+    vkResetQueryPool(dev_, ts_pool_, slot, 2);
+    vkCmdWriteTimestamp2(cb_, VK_PIPELINE_STAGE_2_NONE, ts_pool_, slot);
+    ts_written_[frame_ % kFrames] = true;
 }
 
 void VulkanBackend::CountFps() {
@@ -4078,11 +4107,12 @@ void LogPerf() {
     Perf& p = g_perf;
     double n = double(perf_frames);
     double host = p.draw + p.clear + p.copy + p.present + p.sync;
-    LOGI("perf: %.1f fps %.2f ms/frame | host %.2f (draw %.2f: assemble %.2f bind %.2f [check %.2f, upload %.2f] "
-         "compile %.2f; clear %.2f copy %.2f sync %.2f present %.2f [swap %.2f wait %.2f]) other %.2f",
+    LOGR("perf: %.1f fps %.2f ms/frame | host %.2f (draw %.2f: assemble %.2f bind %.2f [check %.2f, upload %.2f] "
+         "compile %.2f; clear %.2f copy %.2f sync %.2f present %.2f [swap %.2f wait %.2f]) other %.2f | gpu %.2f",
          n * 1000.0 / el, el / n, host / n, p.draw / n, p.assemble / n, p.bind / n, p.sig / n, p.texup / n,
-         p.compile / n, p.clear / n, p.copy / n, p.sync / n, p.present / n, p.swap / n, p.wait / n, (el - host) / n);
-    LOGI("perf: per frame %.0f draws (%.0f raw) %.0fk verts %.1f MB upload %.1f overflow | %.1f tex uploads %.2f MB, "
+         p.compile / n, p.clear / n, p.copy / n, p.sync / n, p.present / n, p.swap / n, p.wait / n, (el - host) / n,
+         p.gpu / n);
+    LOGR("perf: per frame %.0f draws (%.0f raw) %.0fk verts %.1f MB upload %.1f overflow | %.1f tex uploads %.2f MB, "
          "%.1f new tex, %.1f new targets, %.1f target uploads, %.1f shrinks, %.1f read-backs %.1f late | %llu shaders "
          "%llu psos this second",
          p.draws / n, p.raw / n, p.verts / n / 1000.0, p.upload / n / 1048576.0, p.overflow / n, p.texups / n,
@@ -4125,6 +4155,7 @@ void VulkanBackend::Present(const Surface& front) {
         if (shown) CapShown(bi);
         if (g_screenshot.exchange(false)) Screenshot(bi);
     }
+    FrameTimestamp(true);
     Submit(false, acquired);
     present_fence_[presents_ % (kFrames + 1)].store(timeline_value_);
     DeliverReports();
