@@ -90,9 +90,13 @@ if(WIN32)
     list(APPEND XBE_IMGUI_SOURCES ${imgui_SOURCE_DIR}/backends/imgui_impl_dx12.cpp
                                   ${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp)
 else()
-    list(APPEND XBE_IMGUI_SOURCES ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp)
-    # this ImGui's SDL3 backend predates SDL 3.2's renames
-    set_source_files_properties(${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp PROPERTIES COMPILE_DEFINITIONS SDL_ENABLE_OLD_NAMES)
+    # the SDL3 platform backend; SDL's renderer draws a game's own windows before the game's (a launcher)
+    list(APPEND XBE_IMGUI_SOURCES ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
+                                  ${imgui_SOURCE_DIR}/backends/imgui_impl_sdlrenderer3.cpp)
+    # this ImGui's SDL3 backends predate SDL 3.2's renames
+    set_source_files_properties(${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
+                                ${imgui_SOURCE_DIR}/backends/imgui_impl_sdlrenderer3.cpp
+                                PROPERTIES COMPILE_DEFINITIONS SDL_ENABLE_OLD_NAMES)
 endif()
 
 file(GLOB XBE_RUNTIME_SOURCES CONFIGURE_DEPENDS ${XBE_SDK_DIR}/runtime/*/*.cpp)
