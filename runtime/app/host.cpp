@@ -1,6 +1,10 @@
 // What the Windows and Linux hosts share: the program's folders, the instance number, UI lock and frame pacing
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
+#include <string>
+#include <utility>
+#include <vector>
 #include <cwctype>
 #include <thread>
 
@@ -53,6 +57,33 @@ int Instance() {
 std::recursive_mutex& UiLock() {
     static std::recursive_mutex m;
     return m;
+}
+
+namespace {
+const auto g_start = std::chrono::steady_clock::now();  // the program's start, the keys' time base
+}
+
+void StartScriptedKeys(void (*press)(uint32_t vk)) {
+    const char* text = std::getenv("XBE_KEYS");
+    if (!text || !*text) return;
+    std::vector<std::pair<double, uint32_t>> keys;
+    std::string all = text;
+    for (size_t pos = 0; pos < all.size();) {
+        size_t comma = all.find(',', pos);
+        std::string item = all.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        size_t colon = item.find(':');
+        if (colon != std::string::npos)
+            keys.push_back({std::atof(item.substr(0, colon).c_str()), uint32_t(std::atoi(item.c_str() + colon + 1))});
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+    }
+    std::sort(keys.begin(), keys.end());
+    std::thread([keys, press] {
+        for (const auto& [at, vk] : keys) {
+            std::this_thread::sleep_until(g_start + std::chrono::duration<double>(at));
+            press(vk);
+        }
+    }).detach();
 }
 
 void Pace() {

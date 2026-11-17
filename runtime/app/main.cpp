@@ -284,6 +284,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     app::BackupSaves();
     if (app::Instance())
         SetWindowTextW(app::g_hwnd, (std::wstring(app::kGame.title) + L" [" + std::to_wstring(app::Instance()) + L"]").c_str());
+    app::StartScriptedKeys([](uint32_t vk) {
+        PostMessageW(app::g_hwnd, WM_KEYDOWN, vk, 1);
+        PostMessageW(app::g_hwnd, WM_KEYUP, vk, LPARAM(0xC0000001));
+    });
     if (!kernel::Boot(std::move(game.xbe), IMAGE_XBE, game.dir.string(), app::HardDisk().string())) {
         MessageBoxW(app::g_hwnd, L"The game failed to start, see the log in the logs folder.", app::kGame.short_title,
                     MB_ICONERROR);

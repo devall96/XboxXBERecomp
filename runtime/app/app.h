@@ -145,6 +145,9 @@ void FinishHandover();  // any thread but the window thread's: opens the game wi
 
 // held around ImGui: the window thread's messages and the renderer's frame
 std::recursive_mutex& UiLock();
+// XBE_KEYS="<seconds>:<virtual key>,...": each key pressed and let go in the game window at that time after the
+// start, for tests that open menus or take screenshots; press sends one key to the window (any thread)
+void StartScriptedKeys(void (*press)(uint32_t vk));
 
 // what the game repo defines once
 struct Option {  // a setting in the settings file, flag or value

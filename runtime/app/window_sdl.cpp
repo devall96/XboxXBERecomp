@@ -248,6 +248,21 @@ int main(int argc, char** argv) {
     input::Init();
     if (app::kGame.window) app::kGame.window(app::g_window);
     app::BackupSaves();
+    app::StartScriptedKeys([](uint32_t vk) {
+        for (int sc = 0; sc < SDL_SCANCODE_COUNT; sc++) {
+            if (win32_compat::VirtualKey(sc) != int(vk)) continue;
+            for (bool down : {true, false}) {
+                SDL_Event e{};
+                e.type = down ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
+                e.key.windowID = SDL_GetWindowID(app::g_window);
+                e.key.scancode = SDL_Scancode(sc);
+                e.key.key = SDL_GetKeyFromScancode(SDL_Scancode(sc), SDL_KMOD_NONE, false);
+                e.key.down = down;
+                SDL_PushEvent(&e);
+            }
+            return;
+        }
+    });
     if (!kernel::Boot(std::move(game.xbe), IMAGE_XBE, game.dir.string(), app::HardDisk().string())) {
         platform::Message(app::kGame.short_title, L"The game failed to start, see the log in the logs folder.", true);
         return 1;
