@@ -754,8 +754,15 @@ std::wstring Blocker(const std::vector<Target>& targets) {
 #endif
     for (const wchar_t* tool : tools) {
         std::error_code ec;
-        if (!fs::exists(Tool(tool), ec))
-            return L"The compiler folder is missing files. Extract the whole release again, then start the game.";
+        if (fs::exists(Tool(tool), ec)) continue;
+#ifndef _WIN32
+        // the release carries xbe_recomp; clang and ld.lld are the system's where it has them
+        if (std::wstring(tool) != L"xbe_recomp")
+            return L"Preparing the game needs clang and ld.lld. Install them (Ubuntu and Debian: sudo apt install "
+                   L"clang lld; Fedora: sudo dnf install clang lld; Arch: sudo pacman -S clang lld), then start the "
+                   L"game again.";
+#endif
+        return L"The compiler folder is missing files. Extract the whole release again, then start the game.";
     }
     for (const Target& target : targets) {
         if (target.image->config.empty())
