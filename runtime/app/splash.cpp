@@ -1,6 +1,27 @@
-// The boot splash: GameInfo::splash .bmp or .png beside the exe, centred in a borderless window. The game boots behind
-// it with its window hidden and waits at its first frame until the splash has been up kMinimum, since this boot takes
-// a fraction of a second. No file, or a relaunch: no splash. Windows; Linux opens no splash yet (window_sdl.cpp).
+// The boot splash: GameInfo::splash .bmp or .png in the data folder or beside the exe, centred in a borderless window.
+// The game boots behind it with its window hidden and waits at its first frame until the splash has been up kMinimum,
+// since this boot takes a fraction of a second. No file, or a relaunch: no splash. Windows draws it in a layered
+// window, Linux in an SDL one (a desktop may place it itself: Wayland lets no program pick its window's spot).
+#include <filesystem>
+#include <string>
+
+#include "app/app.h"
+
+namespace app {
+namespace {
+// the picture: the data folder's first (a player's own), then the one the release ships beside the executable
+std::filesystem::path SplashFile() {
+    for (const auto& dir : {DataDir(), ExeDir()})
+        for (const wchar_t* ext : {L".bmp", L".png"}) {
+            std::error_code ec;
+            std::filesystem::path path = dir / (std::wstring(kGame.splash) + ext);
+            if (std::filesystem::exists(path, ec)) return path;
+        }
+    return {};
+}
+}  // namespace
+}  // namespace app
+
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -66,14 +87,8 @@ bool OpenSplash() {
     if (std::wcsstr(GetCommandLineW(), L"--relaunched")) return false;
     std::vector<uint32_t> pixels;
     UINT w = 0, h = 0;
-    std::filesystem::path path;
-    for (const wchar_t* ext : {L".bmp", L".png"}) {
-        std::error_code ec;
-        path = DataDir() / (std::wstring(kGame.splash) + ext);
-        if (std::filesystem::exists(path, ec) && Read(path, pixels, w, h)) break;
-        pixels.clear();
-    }
-    if (pixels.empty()) return false;
+    std::filesystem::path path = SplashFile();
+    if (path.empty() || !Read(path, pixels, w, h)) return false;
 
     HINSTANCE inst = GetModuleHandleW(nullptr);
     WNDCLASSEXW wc{sizeof(wc)};
@@ -112,7 +127,7 @@ bool OpenSplash() {
     SetWindowPos(g_splash, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
     g_until = std::chrono::steady_clock::now() + kMinimum;
     g_waiting = true;
-    LOGI("splash: %s, %ux%u", path.string().c_str(), w, h);
+    LOGR("splash: %s, %ux%u", path.string().c_str(), w, h);
     return true;
 }
 
@@ -124,6 +139,78 @@ void SplashFirstFrame() {
 
 void CloseSplash() {
     if (g_splash) DestroyWindow(g_splash);
+    g_splash = nullptr;
+}
+
+}  // namespace app
+#else
+#include <SDL3/SDL.h>
+
+#include <atomic>
+#include <chrono>
+#include <thread>
+
+#include "core/log.h"
+#include "core/platform.h"
+
+namespace app {
+
+namespace {
+constexpr auto kMinimum = std::chrono::seconds(1);
+SDL_Window* g_splash = nullptr;
+std::atomic<bool> g_waiting{false};
+std::chrono::steady_clock::time_point g_until;
+}  // namespace
+
+bool OpenSplash() {
+    if (platform::HasArg(L"--relaunched")) return false;
+    std::filesystem::path path = SplashFile();
+    if (path.empty()) return false;
+    std::string file = platform::Utf8(path.wstring());
+    SDL_Surface* picture = path.extension() == ".png" ? SDL_LoadPNG(file.c_str()) : SDL_LoadBMP(file.c_str());
+    if (!picture) {
+        LOGW("splash: %s could not be read (%s)", file.c_str(), SDL_GetError());
+        return false;
+    }
+    // one picture pixel per screen pixel, as on Windows
+    float density = 1;
+    if (SDL_DisplayID display = SDL_GetPrimaryDisplay()) density = SDL_GetDisplayContentScale(display);
+    if (density <= 0) density = 1;
+    SDL_Renderer* r = nullptr;
+    g_splash = SDL_CreateWindow(platform::Utf8(kGame.title).c_str(), int(picture->w / density), int(picture->h / density),
+                                SDL_WINDOW_BORDERLESS | SDL_WINDOW_HIDDEN | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    if (g_splash) r = SDL_CreateRenderer(g_splash, nullptr);
+    if (!r) {
+        LOGW("splash: no window (%s)", SDL_GetError());
+        if (g_splash) SDL_DestroyWindow(g_splash);
+        g_splash = nullptr;
+        SDL_DestroySurface(picture);
+        return false;
+    }
+    SDL_SetWindowPosition(g_splash, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+    SDL_Texture* texture = SDL_CreateTextureFromSurface(r, picture);
+    SDL_ShowWindow(g_splash);
+    SDL_RenderClear(r);
+    if (texture) SDL_RenderTexture(r, texture, nullptr, nullptr);
+    SDL_RenderPresent(r);
+    if (texture) SDL_DestroyTexture(texture);
+    LOGR("splash: %s, %dx%d", file.c_str(), picture->w, picture->h);
+    SDL_DestroySurface(picture);
+    g_until = std::chrono::steady_clock::now() + kMinimum;
+    g_waiting = true;
+    return true;
+}
+
+void SplashFirstFrame() {
+    if (!g_waiting.exchange(false)) return;
+    std::this_thread::sleep_until(g_until);
+    OpenGameWindow();
+}
+
+void CloseSplash() {
+    if (!g_splash) return;
+    SDL_DestroyRenderer(SDL_GetRenderer(g_splash));
+    SDL_DestroyWindow(g_splash);
     g_splash = nullptr;
 }
 

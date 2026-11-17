@@ -336,8 +336,12 @@ void SetFrameBuffers(const char* caller, uint32_t pp) {
             // no owner window: this runs on the title's thread and the window may already be fullscreen over the box
 #ifdef _WIN32
             MessageBoxW(nullptr,
-                        L"The renderer could not be started. Make sure your graphics card supports Direct3D 12 or "
-                        L"Vulkan 1.3 and its driver is up to date.",
+                        L"The game draws with Vulkan 1.3 or Direct3D 12, and this PC's graphics driver offers "
+                        L"neither.\n\n"
+                        L"Update your graphics driver, then start the game again:\n"
+                        L"  AMD, NVIDIA or Intel: the driver from their website or their app\n"
+                        L"  Others: Windows Update\n\n"
+                        L"The log in the logs folder says which part failed.",
                         app::kGame.short_title, MB_ICONERROR | MB_TOPMOST);
 #else
             platform::Message(app::kGame.short_title,

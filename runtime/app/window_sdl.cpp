@@ -194,10 +194,6 @@ uint32_t RefreshRate() {
 // HDR output on Linux comes with the Vulkan swap chain's colour spaces: none yet
 HdrInfo HdrDisplay(void*) { return {}; }
 
-// the boot splash is a Windows window for now: the game window opens at once
-bool OpenSplash() { return false; }
-void SplashFirstFrame() {}
-void CloseSplash() {}
 
 }  // namespace app
 
