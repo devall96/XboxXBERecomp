@@ -344,15 +344,7 @@ void SetFrameBuffers(const char* caller, uint32_t pp) {
                         L"The log in the logs folder says which part failed.",
                         app::kGame.short_title, MB_ICONERROR | MB_TOPMOST);
 #else
-            platform::Message(app::kGame.short_title,
-                              L"The game draws with Vulkan 1.3, and this PC's graphics driver does not offer it.\n\n"
-                              L"Install your system's Vulkan driver, then start the game again:\n"
-                              L"  Ubuntu, Debian, Mint: sudo apt install mesa-vulkan-drivers\n"
-                              L"  Fedora: sudo dnf install mesa-vulkan-drivers\n"
-                              L"  Arch: sudo pacman -S vulkan-radeon (AMD) or vulkan-intel (Intel)\n"
-                              L"  NVIDIA: the NVIDIA driver from your system's driver manager\n\n"
-                              L"The log in the logs folder says which part failed.",
-                              true);
+            platform::Message(app::kGame.short_title, platform::VulkanDriverHelp(), true);
 #endif
             kernel::Shutdown(1);
         }

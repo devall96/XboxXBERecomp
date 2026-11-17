@@ -26,7 +26,9 @@ void SleepMs(uint32_t ms);
 uint32_t ProcessId();
 
 // a message box on its own (no parent window); AskYesNo defaults to No
-void Message(const wchar_t* title, const std::wstring& text, bool error);
+void Message(const wchar_t* title, const std::wstring& text, bool error);  // also in the log (and stderr on Linux)
+// Linux: what to install when the PC offers no Vulkan 1.3 driver, for the player
+std::wstring VulkanDriverHelp();
 bool AskYesNo(const wchar_t* title, const std::wstring& text);
 
 std::string Utf8(const std::wstring& w);

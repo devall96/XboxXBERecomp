@@ -17,6 +17,9 @@
 #include <shellapi.h>
 #else
 #include <SDL3/SDL_messagebox.h>
+#include <cstdio>
+
+#include "core/log.h"
 #include <pthread.h>
 #include <unistd.h>
 
@@ -146,9 +149,25 @@ void NameThread(const char* name) {
 void SleepMs(uint32_t ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
 uint32_t ProcessId() { return uint32_t(getpid()); }
 
+// the text goes to the log and stderr first: SDL shows its boxes through zenity or kdialog, and a desktop without
+// either shows nothing
 void Message(const wchar_t* title, const std::wstring& text, bool error) {
-    SDL_ShowSimpleMessageBox(error ? SDL_MESSAGEBOX_ERROR : SDL_MESSAGEBOX_INFORMATION, Utf8(title).c_str(),
-                             Utf8(text).c_str(), nullptr);
+    std::string t = Utf8(text);
+    if (error) LOGE("message: %s", t.c_str());
+    else LOGR("message: %s", t.c_str());
+    std::fprintf(stderr, "%s: %s\n", Utf8(title).c_str(), t.c_str());
+    SDL_ShowSimpleMessageBox(error ? SDL_MESSAGEBOX_ERROR : SDL_MESSAGEBOX_INFORMATION, Utf8(title).c_str(), t.c_str(),
+                             nullptr);
+}
+
+std::wstring VulkanDriverHelp() {
+    return L"The game draws with Vulkan 1.3, and this PC's graphics driver does not offer it.\n\n"
+           L"Install your system's Vulkan driver, then start the game again:\n"
+           L"  Ubuntu, Debian, Mint: sudo apt install mesa-vulkan-drivers\n"
+           L"  Fedora: sudo dnf install mesa-vulkan-drivers\n"
+           L"  Arch: sudo pacman -S vulkan-radeon (AMD) or vulkan-intel (Intel)\n"
+           L"  NVIDIA: the NVIDIA driver from your system's driver manager\n\n"
+           L"The log in the logs folder says which part failed.";
 }
 
 bool AskYesNo(const wchar_t* title, const std::wstring& text) {

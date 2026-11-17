@@ -229,8 +229,13 @@ int main(int argc, char** argv) {
                                      SDL_WINDOW_HIDDEN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY |
                                          SDL_WINDOW_VULKAN);
     if (!app::g_window) {
-        LOGE("SDL: no window: %s", SDL_GetError());
-        platform::Message(app::kGame.short_title, L"The game window could not be opened.", true);
+        std::string why = SDL_GetError();
+        LOGE("SDL: no window: %s", why.c_str());
+        // a window for Vulkan fails first where the PC has no Vulkan driver: the same help as the renderer's
+        bool vulkan = why.find("Vulkan") != std::string::npos || why.find("vulkan") != std::string::npos;
+        platform::Message(app::kGame.short_title,
+                          vulkan ? platform::VulkanDriverHelp() : std::wstring(L"The game window could not be opened."),
+                          true);
         return 1;
     }
     app::ApplyNow();
