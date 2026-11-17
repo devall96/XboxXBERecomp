@@ -54,8 +54,8 @@ struct Settings {
     uint32_t colour_filter = 0;        // colour vision: 0 none, 1 protanopia, 2 deuteranopia, 3 tritanopia
     uint32_t colour_filter_strength = 100;  // percent
     std::string colour_lut;            // a .cube file in luts\ in the data folder, empty for none
-    // the renderer where there is a choice (Windows): kRendererVulkan (the default) or kRendererD3D12; HDR10 is
-    // D3D12's, so hdr draws with D3D12 whichever is chosen. Linux always draws with Vulkan
+    // the renderer where there is a choice (Windows): kRendererVulkan (the default) or kRendererD3D12. Linux always
+    // draws with Vulkan
     uint32_t renderer = kRendererVulkan;
     uint32_t upscaler = 1;             // 0 bilinear, 1 AMD FSR 1 (EASU) when the view renders smaller than it shows
     uint32_t sharpen = 0;              // 0 off, to 100: FSR 1's RCAS, 2 stops (100 the sharpest)
