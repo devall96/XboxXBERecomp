@@ -608,14 +608,68 @@ void PaintFrame(HDC dc, RECT box, const wchar_t* tab, int (*s)(int)) {
 }
 
 UINT g_dpi = 96;
+bool g_dpi_fixed = false;  // XBE_TEST_DPI: a test run's scale, kept when the window moves between monitors
 int Scaled(int v) { return MulDiv(v, int(g_dpi), 96); }
 
-void Paint(HDC dc, const RECT& client) {
-    auto s = Scaled;
-    SetBkMode(dc, TRANSPARENT);
-    int w = client.right, h = client.bottom;
+// a failed build stays up in the same window: what failed, and the end of the compiler's log
+bool g_failed = false;
+std::vector<std::wstring> g_log_lines;
 
-    // the header: the title, what this screen is, and a rule under them
+// the last lines of logs\compile.log, where a compiler's error is
+std::wstring CompileLogTail() {
+    constexpr size_t kTailBytes = 1500;
+    std::ifstream f(CompileLog(), std::ios::binary | std::ios::ate);
+    if (!f) return {};
+    std::streamoff size = f.tellg();
+    std::streamoff start = size > std::streamoff(kTailBytes) ? size - std::streamoff(kTailBytes) : 0;
+    std::string tail(size_t(size - start), '\0');
+    f.seekg(start);
+    f.read(tail.data(), std::streamsize(tail.size()));
+    if (start) tail.erase(0, tail.find('\n') + 1);  // from a whole line
+    int length = MultiByteToWideChar(CP_UTF8, 0, tail.data(), int(tail.size()), nullptr, 0);
+    std::wstring text(size_t(length), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, tail.data(), int(tail.size()), text.data(), length);
+    return text;
+}
+
+std::vector<std::wstring> Lines(const std::wstring& text) {
+    std::vector<std::wstring> lines;
+    size_t at = 0;
+    while (at <= text.size()) {
+        size_t end = text.find(L'\n', at);
+        if (end == std::wstring::npos) end = text.size();
+        std::wstring line = text.substr(at, end - at);
+        if (!line.empty() && line.back() == L'\r') line.pop_back();
+        lines.push_back(line);
+        at = end + 1;
+    }
+    while (!lines.empty() && lines.back().empty()) lines.pop_back();
+    return lines;
+}
+
+// the window's size: the progress page, or the failure page, taller when it has the log to show
+SIZE WindowSize() {
+    if (g_failed && !g_log_lines.empty()) return {Scaled(820), Scaled(560)};
+    if (g_failed) return {Scaled(640), Scaled(300)};
+    return {Scaled(640), Scaled(292)};
+}
+
+// centred on the monitor the window is on, at its size
+void PlaceWindow(HWND hwnd) {
+    SIZE size = WindowSize();
+    MONITORINFO mi{sizeof(mi)};
+    GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &mi);
+    RECT work = mi.rcWork;
+    // never bigger than the screen: a small one at a high scale gets fewer of the log's lines
+    size.cx = std::min<LONG>(size.cx, work.right - work.left - Scaled(16));
+    size.cy = std::min<LONG>(size.cy, work.bottom - work.top - Scaled(16));
+    int x = work.left + (work.right - work.left - size.cx) / 2;
+    int y = work.top + (work.bottom - work.top - size.cy) / 2;
+    SetWindowPos(hwnd, nullptr, x, y, size.cx, size.cy, SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+void PaintHeader(HDC dc, int w) {
+    auto s = Scaled;
     std::wstring title = kGame.title;
     for (wchar_t& c : title) c = wchar_t(towupper(c));
     PaintWord(dc, s(22), s(10), std::max(1, s(2)), title);
@@ -628,14 +682,76 @@ void Paint(HDC dc, const RECT& client) {
     LineTo(dc, w - s(22), s(72));
     SelectObject(dc, old_pen);
     DeleteObject(rule);
+    SelectObject(dc, old);
+}
+
+void FrameBox(HDC dc, RECT box, COLORREF fill, COLORREF edge) {
+    FillBox(dc, box, fill);
+    HBRUSH brush = CreateSolidBrush(edge);
+    FrameRect(dc, &box, brush);
+    DeleteObject(brush);
+}
+
+// what failed, in the player's words, then the end of the compiler's log in a terminal box
+void PaintFailure(HDC dc, const RECT& frame) {
+    auto s = Scaled;
+    int left = frame.left + s(22), right = frame.right - s(22), y = frame.top + s(38), bottom = frame.bottom - s(16);
+    HGDIOBJ old = SelectObject(dc, g_fonts.heading);
+    DrawLine(dc, {left, y, right, y + s(28)}, L"THE BUILD FAILED", kRed, DT_LEFT);
+    y += s(34);
+
+    SelectObject(dc, g_fonts.body);
+    SetTextColor(dc, kWhite);
+    std::wstring what = g_failure.empty() ? std::wstring(L"Preparing the game failed.") : g_failure;
+    RECT text{left, y, right, y + s(44)};
+    DrawTextW(dc, what.c_str(), -1, &text, DT_WORDBREAK | DT_NOPREFIX | DT_END_ELLIPSIS);
+    y += s(50);
+
+    SelectObject(dc, g_fonts.term);
+    RECT foot{left, bottom - s(20), right, bottom};
+    DrawLine(dc, foot, g_log_lines.empty() ? L"" : L"Full details: logs\\compile.log", kGreenDim, DT_LEFT);
+    DrawLine(dc, foot, L"ESC OR ENTER CLOSES", kGreenDim, DT_RIGHT);
+    if (g_log_lines.empty()) {
+        SelectObject(dc, old);
+        return;
+    }
+
+    DrawLine(dc, {left, y, right, y + s(20)}, L"> The last lines of the log", kGreen, DT_LEFT);
+    y += s(24);
+    RECT box{left, y, right, foot.top - s(10)};
+    FrameBox(dc, box, kBarEmpty, kGreenDim);
+    TEXTMETRICW tm{};
+    GetTextMetricsW(dc, &tm);
+    int line_h = std::max(1, int(tm.tmHeight));
+    int fit = std::max(0, int((box.bottom - box.top - s(16)) / line_h));
+    size_t first = g_log_lines.size() > size_t(fit) ? g_log_lines.size() - size_t(fit) : 0;
+    int ly = box.top + s(8);
+    for (size_t i = first; i < g_log_lines.size(); i++, ly += line_h) {
+        RECT row{box.left + s(10), ly, box.right - s(10), ly + line_h};
+        SetTextColor(dc, kWhite);
+        DrawTextW(dc, g_log_lines[i].c_str(), int(g_log_lines[i].size()), &row,
+                  DT_SINGLELINE | DT_NOPREFIX | DT_EXPANDTABS | DT_END_ELLIPSIS);
+    }
+    SelectObject(dc, old);
+}
+
+void Paint(HDC dc, const RECT& client) {
+    auto s = Scaled;
+    SetBkMode(dc, TRANSPARENT);
+    int w = client.right, h = client.bottom;
+    PaintHeader(dc, w);
 
     // the frame and what is in it
     bool stopping = g_progress.cancel;
     RECT frame{s(22), s(86), w - s(22), h - s(20)};
-    PaintFrame(dc, frame, stopping ? L"STOPPING" : L"PREPARING", s);
+    PaintFrame(dc, frame, g_failed ? L"STOPPED" : stopping ? L"STOPPING" : L"PREPARING", s);
+    if (g_failed) {
+        PaintFailure(dc, frame);
+        return;
+    }
     int left = frame.left + s(22), right = frame.right - s(22), y = frame.top + s(38);
 
-    SelectObject(dc, g_fonts.heading);
+    HGDIOBJ old = SelectObject(dc, g_fonts.heading);
     DrawLine(dc, {left, y, right, y + s(28)}, stopping ? L"STOPPING" : L"BUILDING THE GAME'S CODE", stopping ? kRed : kGreen,
              DT_LEFT);
     y += s(30);
@@ -651,17 +767,13 @@ void Paint(HDC dc, const RECT& client) {
     y += s(24);
 
     RECT bar{left, y, right, y + s(18)};
-    FillBox(dc, bar, kBarEmpty);
+    FrameBox(dc, bar, kBarEmpty, kGreenDim);
     RECT filled = bar;
     filled.right = bar.left + LONG(float(bar.right - bar.left) * Fraction());
     FillBox(dc, filled, kGreen);
-    HBRUSH edge = CreateSolidBrush(kGreenDim);
-    FrameRect(dc, &bar, edge);
-    DeleteObject(edge);
     y += s(26);
 
-    std::wstring left_text = TimeLeftText();
-    DrawLine(dc, {left, y, right, y + s(20)}, left_text, kGreenDim, DT_LEFT);
+    DrawLine(dc, {left, y, right, y + s(20)}, TimeLeftText(), kGreenDim, DT_LEFT);
     DrawLine(dc, {left, y, right, y + s(20)}, L"ESC STOPS", kGreenDim, DT_RIGHT);
     SelectObject(dc, old);
 }
@@ -695,6 +807,16 @@ void CloseWindowWith(HWND hwnd, bool start) {
     DeleteFonts();
 }
 
+// the failure page in place of a message box: it stays up until the player closes it
+void ShowFailed(HWND hwnd, bool with_log) {
+    g_failed = true;
+    if (with_log) g_log_lines = Lines(CompileLogTail());
+    SetClassLongPtrW(hwnd, GCLP_HCURSOR, LONG_PTR(LoadCursorW(nullptr, MAKEINTRESOURCEW(32512))));  // IDC_ARROW
+    PlaceWindow(hwnd);
+    InvalidateRect(hwnd, nullptr, FALSE);
+    FlashWindow(hwnd, TRUE);
+}
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_PAINT:
@@ -703,24 +825,41 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_ERASEBKGND:
             return 1;
         case WM_TIMER:
-            InvalidateRect(hwnd, nullptr, FALSE);
+            if (!g_failed) InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         case WM_NCHITTEST:
             return HTCAPTION;  // no title bar: the whole window drags it
+        case WM_NCLBUTTONDBLCLK:
+            return 0;  // and a double click does not maximise it
+        case WM_DPICHANGED: {
+            // moved to a monitor at another scale: the fonts and sizes follow it
+            if (!g_dpi_fixed) g_dpi = HIWORD(wp);
+            DeleteFonts();
+            MakeFonts(g_dpi);
+            const RECT* r = reinterpret_cast<const RECT*>(lp);
+            SIZE size = WindowSize();
+            SetWindowPos(hwnd, nullptr, r->left, r->top, size.cx, size.cy, SWP_NOZORDER | SWP_NOACTIVATE);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
         case WM_KEYDOWN:
-            if (wp == VK_ESCAPE) g_progress.cancel = true;
+            if (g_failed && (wp == VK_ESCAPE || wp == VK_RETURN || wp == VK_SPACE)) CloseWindowWith(hwnd, false);
+            else if (wp == VK_ESCAPE) g_progress.cancel = true;
             return 0;
         case WM_CLOSE:
-            g_progress.cancel = true;  // the build ends at its next step, then the window closes
+            if (g_failed) CloseWindowWith(hwnd, false);
+            else g_progress.cancel = true;  // the build ends at its next step, then the window closes
             return 0;
         case kBuildDone:
-            CloseWindowWith(hwnd, wp != 0);  // built: straight into the game; failed or stopped: out
+            if (wp) CloseWindowWith(hwnd, true);  // built: straight into the game
+            else if (g_progress.cancel) CloseWindowWith(hwnd, false);  // stopped
+            else ShowFailed(hwnd, true);
             return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-// centred on the primary monitor, sized for its DPI, borderless with its own edge
+// centred on the primary monitor, sized for its scale (XBE_TEST_DPI sets one for tests), borderless with its own edge
 HWND OpenWindow() {
     HINSTANCE inst = GetModuleHandleW(nullptr);
     WNDCLASSEXW wc{sizeof(wc)};
@@ -731,65 +870,66 @@ HWND OpenWindow() {
     std::wstring class_name = std::wstring(kGame.name) + L"GameCode";
     wc.lpszClassName = class_name.c_str();
     RegisterClassExW(&wc);
+    POINT origin{0, 0};
+    HMONITOR primary = MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY);
     g_dpi = GetDpiForSystem();
+    if (const char* test = std::getenv("XBE_TEST_DPI"); test && std::atoi(test) >= 48) {
+        g_dpi = UINT(std::atoi(test));
+        g_dpi_fixed = true;
+    }
     MakeFonts(g_dpi);
-    int w = Scaled(640), h = Scaled(292);
-    int x = (GetSystemMetrics(SM_CXSCREEN) - w) / 2;
-    int y = (GetSystemMetrics(SM_CYSCREEN) - h) / 2;
+    SIZE size = WindowSize();
+    MONITORINFO mi{sizeof(mi)};
+    GetMonitorInfoW(primary, &mi);
+    int x = mi.rcWork.left + (mi.rcWork.right - mi.rcWork.left - size.cx) / 2;
+    int y = mi.rcWork.top + (mi.rcWork.bottom - mi.rcWork.top - size.cy) / 2;
     HWND hwnd = CreateWindowExW(WS_EX_APPWINDOW, wc.lpszClassName, kGame.title, WS_POPUP | WS_MINIMIZEBOX | WS_SYSMENU,
-                                x, y, w, h, nullptr, nullptr, inst, nullptr);
+                                x, y, size.cx, size.cy, nullptr, nullptr, inst, nullptr);
+    if (!g_dpi_fixed) {
+        // the monitor's own scale, which can differ from the one Windows started with
+        if (UINT dpi = GetDpiForWindow(hwnd); dpi && dpi != g_dpi) {
+            g_dpi = dpi;
+            DeleteFonts();
+            MakeFonts(g_dpi);
+            PlaceWindow(hwnd);
+        }
+    }
     SetTimer(hwnd, 1, 100, nullptr);
     ShowWindow(hwnd, SW_SHOW);
     SetForegroundWindow(hwnd);
     return hwnd;
 }
 
-// the last lines of logs\compile.log, where a compiler's error is
-std::wstring CompileLogTail() {
-    constexpr size_t kTailBytes = 1500;
-    std::ifstream f(CompileLog(), std::ios::binary | std::ios::ate);
-    if (!f) return {};
-    std::streamoff size = f.tellg();
-    std::streamoff start = size > std::streamoff(kTailBytes) ? size - std::streamoff(kTailBytes) : 0;
-    std::string tail(size_t(size - start), '\0');
-    f.seekg(start);
-    f.read(tail.data(), std::streamsize(tail.size()));
-    if (start) tail.erase(0, tail.find('\n') + 1);  // from a whole line
-    int length = MultiByteToWideChar(CP_UTF8, 0, tail.data(), int(tail.size()), nullptr, 0);
-    std::wstring text(size_t(length), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, tail.data(), int(tail.size()), text.data(), length);
-    return text;
-}
-
-void ShowFailure() {
-    std::wstring text = L"Preparing the game failed. " + g_failure;
-    if (std::wstring tail = CompileLogTail(); !tail.empty()) text += L"\n\nThe last lines of the log:\n\n" + tail;
-    text += L"\n\nThe full details are in logs\\compile.log.";
-    MessageBoxW(nullptr, text.c_str(), kGame.title, MB_ICONERROR);
-}
-
-// the build on its own thread, the window on this one; false when it failed, the player stopped it, or chose Exit
+// the build on its own thread, the window on this one; false when it failed or the player stopped it. A failure,
+// or what keeps the build from starting, shows in the window until the player closes it.
 bool BuildWithWindow(std::vector<Target>& targets) {
-    if (std::wstring blocker = Blocker(targets); !blocker.empty()) {
-        MessageBoxW(nullptr, blocker.c_str(), kGame.title, MB_ICONERROR);
-        return false;
-    }
-    SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);  // no sleep while it works
+    g_failed = false;
+    g_log_lines.clear();
+    std::wstring blocker = Blocker(targets);
     g_window = OpenWindow();
     bool ok = false;
-    std::thread worker([&] {
-        ok = Build(targets);
-        if (ok) g_progress.stage = Stage::Ready;
-        PostMessageW(g_window, kBuildDone, ok, 0);
-    });
+    std::thread worker;
+    if (!blocker.empty()) {
+        g_failure = blocker;
+        LOGE("Game code: %ls", blocker.c_str());
+        ShowFailed(g_window, false);
+    } else {
+        SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);  // no sleep while it works
+        worker = std::thread([&] {
+            ok = Build(targets);
+            if (ok) g_progress.stage = Stage::Ready;
+            PostMessageW(g_window, kBuildDone, ok, 0);
+        });
+    }
     MSG msg;
     while (IsWindow(g_window) && GetMessageW(&msg, nullptr, 0, 0) > 0) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
-    worker.join();
-    SetThreadExecutionState(ES_CONTINUOUS);
-    if (!ok && !g_progress.cancel) ShowFailure();
+    if (worker.joinable()) {
+        worker.join();
+        SetThreadExecutionState(ES_CONTINUOUS);
+    }
     return ok && g_start;
 }
 
