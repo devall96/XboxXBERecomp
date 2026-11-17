@@ -149,6 +149,8 @@ void OnEvent(const SDL_Event& e) {
             // Windows asks for the cursor on each move inside the client area; left to the host, it shows
             if (!Message(WM_SETCURSOR, WPARAM(g_window), LPARAM(HTCLIENT) | (LPARAM(WM_MOUSEMOVE) << 16)))
                 win32_compat::ShowCursorAgain();
+            // after: the move that captures the mouse already counts as relative, so the camera does not jump
+            win32_compat::MouseMoved(e.motion.x, e.motion.y, e.motion.xrel, e.motion.yrel);
             break;
         case SDL_EVENT_WINDOW_FOCUS_LOST:
             Message(WM_KILLFOCUS, 0, 0);

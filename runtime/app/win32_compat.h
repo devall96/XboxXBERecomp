@@ -91,6 +91,8 @@ inline UINT GetWindowsDirectoryW(wchar_t* out, UINT size) {
 namespace win32_compat {
 int VirtualKey(int sdl_scancode);  // 0 for a key without one
 bool CursorHidden();               // SetCursor(null) since the last WM_SETCURSOR
-void ShowCursorAgain();
+void ShowCursorAgain();               // and leaves relative mode
+void HideCursor();                    // SetCursor(null): hidden, in relative mode for mouse look
+void MouseMoved(float x, float y, float dx, float dy);  // each SDL motion event, for GetCursorPos
 }  // namespace win32_compat
 #endif

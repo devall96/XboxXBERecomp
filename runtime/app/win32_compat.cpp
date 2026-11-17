@@ -15,6 +15,21 @@ namespace win32_compat {
 
 namespace {
 std::atomic<bool> g_hidden{false};
+// the cursor as the game sees it: SDL's while it shows; while the game hides it (mouse look) the window is in relative
+// mode and this moves by the mouse's own motion, since Wayland lets no program move the real pointer
+std::atomic<float> g_x{0}, g_y{0};
+
+SDL_Window* Game() { return static_cast<SDL_Window*>(app::Window()); }
+}
+
+void MouseMoved(float x, float y, float dx, float dy) {
+    if (g_hidden) {
+        g_x = g_x + dx;
+        g_y = g_y + dy;
+    } else {
+        g_x = x;
+        g_y = y;
+    }
 }
 
 int VirtualKey(int sc) {
@@ -70,7 +85,18 @@ int VirtualKey(int sc) {
 
 bool CursorHidden() { return g_hidden; }
 void ShowCursorAgain() {
-    if (g_hidden.exchange(false)) SDL_ShowCursor();
+    if (!g_hidden.exchange(false)) return;
+    if (SDL_Window* w = Game()) {
+        SDL_SetWindowRelativeMouseMode(w, false);
+        SDL_WarpMouseInWindow(w, g_x, g_y);  // back where the game last put it (honoured where the system allows)
+    }
+    SDL_ShowCursor();
+}
+
+void HideCursor() {
+    if (g_hidden.exchange(true)) return;
+    SDL_HideCursor();
+    if (SDL_Window* w = Game()) SDL_SetWindowRelativeMouseMode(w, true);
 }
 
 }  // namespace win32_compat
@@ -125,14 +151,16 @@ BOOL GetClientRect(HWND hwnd, RECT* rc) {
 }
 
 BOOL GetCursorPos(POINT* p) {
-    float x = 0, y = 0;
-    SDL_GetMouseState(&x, &y);
-    *p = {int32_t(x), int32_t(y)};
+    *p = {int32_t(win32_compat::g_x), int32_t(win32_compat::g_y)};
     return 1;
 }
 
 BOOL SetCursorPos(int x, int y) {
-    if (SDL_Window* w = GameWindow()) SDL_WarpMouseInWindow(w, float(x), float(y));
+    win32_compat::g_x = float(x);
+    win32_compat::g_y = float(y);
+    // hidden, the window is in relative mode: the position is the game's alone
+    if (!win32_compat::g_hidden)
+        if (SDL_Window* w = GameWindow()) SDL_WarpMouseInWindow(w, float(x), float(y));
     return 1;
 }
 
@@ -145,7 +173,7 @@ DWORD GetWindowThreadProcessId(HWND hwnd, DWORD* pid) {
 }
 
 HCURSOR SetCursor(HCURSOR cursor) {
-    if (!cursor && !win32_compat::g_hidden.exchange(true)) SDL_HideCursor();
+    if (!cursor) win32_compat::HideCursor();
     return nullptr;
 }
 #endif
