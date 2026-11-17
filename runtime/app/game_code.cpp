@@ -9,10 +9,10 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#include <xinput.h>
 
 #include <algorithm>
 #include <cstdlib>
+#include <cwctype>
 #include <atomic>
 #include <chrono>
 #include <fstream>
@@ -22,7 +22,6 @@
 #include <toml++/toml.hpp>
 
 #include "app/app.h"
-#include "core/input.h"
 #include "core/log.h"
 #include "hook_exports.h"
 #include "image_symbols.h"
@@ -56,12 +55,16 @@ constexpr wchar_t kLinkFlags[] = L"/dll /noentry /nodefaultlib /machine:x64 /opt
 constexpr uint64_t kJobMemory = 512ull << 20;  // a compiler's peak on the biggest file is about half of this
 constexpr uint64_t kDiskNeeded = 1ull << 30;    // both images' sources, objects and DLLs, with room to spare
 
-// the window's colours
-constexpr COLORREF kBackground = RGB(10, 11, 10);
-constexpr COLORREF kText = RGB(227, 232, 219);
-constexpr COLORREF kDim = RGB(145, 153, 138);
-constexpr COLORREF kBarEmpty = RGB(28, 33, 26);
-constexpr COLORREF kBarFull = RGB(145, 158, 130);
+// the window's colours, the Configuration app's
+constexpr COLORREF kBack = RGB(5, 22, 24);
+constexpr COLORREF kBack2 = RGB(9, 38, 40);
+constexpr COLORREF kPanel = RGB(6, 29, 31);
+constexpr COLORREF kGreen = RGB(57, 242, 138);
+constexpr COLORREF kGreenDim = RGB(31, 143, 85);
+constexpr COLORREF kBarEmpty = RGB(4, 16, 18);
+constexpr COLORREF kRed = RGB(224, 52, 58);
+constexpr COLORREF kWhite = RGB(235, 248, 240);
+constexpr COLORREF kBlack = RGB(0, 0, 0);
 
 enum class Stage { Translating, Compiling, Linking, Ready };
 
@@ -80,9 +83,7 @@ struct Progress {
 Progress g_progress;
 std::wstring g_failure;  // the step that failed, written by the build thread before it ends
 HWND g_window = nullptr;
-bool g_start = false;  // the player picked Start once the game was ready
-bool g_delete_compiler = false;  // ticked on the ready page
-uint64_t g_compiler_bytes = 0;
+bool g_start = false;  // the build finished, so the game goes on
 constexpr UINT kBuildDone = WM_APP + 1;
 
 int64_t NowMs() {
@@ -462,7 +463,7 @@ std::wstring StageText() {
         case Stage::Linking:
             return L"Linking the game's code";
         default:
-            return L"Start the game now?";
+            return L"Starting the game";
     }
 }
 
@@ -489,6 +490,47 @@ float Fraction() {
     }
 }
 
+// ---- the window, in the Configuration app's look: a teal room with a faint grid and scanlines, the title as a big
+// slanted word, and a green terminal frame with a tab and a cut corner. It has no choices: the game starts by itself
+// once the build is done, and Escape or closing it stops the build, keeping what is done for the next start.
+
+COLORREF Mix(COLORREF a, COLORREF b, int alpha) {  // b over a, alpha of 255
+    auto c = [&](int x, int y) { return (x * (255 - alpha) + y * alpha) / 255; };
+    return RGB(c(GetRValue(a), GetRValue(b)), c(GetGValue(a), GetGValue(b)), c(GetBValue(a), GetBValue(b)));
+}
+
+struct Fonts {
+    HFONT word = nullptr;     // the title
+    HFONT heading = nullptr;  // the frame's heading
+    HFONT body = nullptr;     // the note under it
+    HFONT term = nullptr;     // the tab, the stage and the numbers
+};
+Fonts g_fonts;
+
+HFONT MakeFont(const wchar_t* face, int px, int weight, bool italic = false) {
+    LOGFONTW lf{};
+    lf.lfHeight = -px;
+    lf.lfWeight = weight;
+    lf.lfItalic = italic;
+    lf.lfQuality = CLEARTYPE_QUALITY;
+    wcsncpy_s(lf.lfFaceName, face, _TRUNCATE);
+    return CreateFontIndirectW(&lf);
+}
+
+void MakeFonts(UINT dpi) {
+    auto s = [&](int v) { return MulDiv(v, int(dpi), 96); };
+    g_fonts.word = MakeFont(L"Bahnschrift", s(44), FW_BOLD, true);
+    g_fonts.heading = MakeFont(L"Bahnschrift", s(22), FW_SEMIBOLD);
+    g_fonts.body = MakeFont(L"Bahnschrift", s(15), FW_NORMAL);
+    g_fonts.term = MakeFont(L"Consolas", s(15), FW_NORMAL);
+}
+
+void DeleteFonts() {
+    for (HFONT f : {g_fonts.word, g_fonts.heading, g_fonts.body, g_fonts.term})
+        if (f) DeleteObject(f);
+    g_fonts = {};
+}
+
 void DrawLine(HDC dc, RECT row, const std::wstring& text, COLORREF color, UINT align) {
     SetTextColor(dc, color);
     DrawTextW(dc, text.c_str(), int(text.size()), &row, align | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
@@ -500,68 +542,129 @@ void FillBox(HDC dc, const RECT& box, COLORREF color) {
     DeleteObject(brush);
 }
 
-// top to bottom: a heading, the stage, the bar, then the percentage and time left, or the buttons once ready
-struct Layout {
-    RECT heading;
-    RECT stage;
-    RECT bar;
-    RECT bottom;
-    RECT start;
-    RECT exit;
-    RECT delete_toggle;
-};
-
-Layout Arrange(const RECT& client, int unit) {
-    Layout l;
-    l.heading = {client.left + unit, client.top + unit, client.right - unit, client.top + unit * 3};
-    l.stage = l.heading;
-    OffsetRect(&l.stage, 0, unit * 2);
-    l.bar = {l.stage.left, l.stage.bottom + unit / 2, l.stage.right, l.stage.bottom + unit / 2 + unit};
-    l.bottom = {l.bar.left, l.bar.bottom + unit / 2, l.bar.right, l.bar.bottom + unit / 2 + unit * 2};
-    l.exit = {l.bottom.right - unit * 8, l.bottom.top, l.bottom.right, l.bottom.bottom};
-    l.start = {l.exit.left - unit * 9, l.bottom.top, l.exit.left - unit, l.bottom.bottom};
-    l.delete_toggle = {l.bottom.left, l.bottom.top, l.start.left - unit, l.bottom.bottom};
-    return l;
+// a filled shape with its outline
+void Shape(HDC dc, const POINT* points, int count, COLORREF line, int width, COLORREF fill) {
+    HPEN pen = CreatePen(PS_SOLID, width, line);
+    HBRUSH brush = CreateSolidBrush(fill);
+    HGDIOBJ old_pen = SelectObject(dc, pen), old_brush = SelectObject(dc, brush);
+    Polygon(dc, points, count);
+    SelectObject(dc, old_brush);
+    SelectObject(dc, old_pen);
+    DeleteObject(brush);
+    DeleteObject(pen);
 }
 
-// the ready page's buttons, with the controller button that presses each
-void PaintChoices(HDC dc, const Layout& l, int unit) {
-    FillBox(dc, l.start, kBarFull);
-    DrawLine(dc, l.start, L"Start (A)", kBackground, DT_CENTER);
-    FillBox(dc, l.exit, kBarEmpty);
-    DrawLine(dc, l.exit, L"Exit (B)", kText, DT_CENTER);
-    int middle = (l.delete_toggle.top + l.delete_toggle.bottom) / 2;
-    RECT box{l.delete_toggle.left, middle - unit / 2, l.delete_toggle.left + unit, middle + unit / 2};
-    FillBox(dc, box, kBarEmpty);
-    if (g_delete_compiler) InflateRect(&box, -unit / 4, -unit / 4);
-    if (g_delete_compiler) FillBox(dc, box, kBarFull);
-    RECT label = l.delete_toggle;
-    label.left += unit * 3 / 2;
-    std::wstring megabytes = std::to_wstring(g_compiler_bytes >> 20);
-    DrawLine(dc, label, L"Delete the compiler files, " + megabytes + L" MB (X)", kText, DT_LEFT);
-}
-
-void Paint(HDC dc, const RECT& client, int unit) {
-    Layout l = Arrange(client, unit);
-    bool ready = g_progress.stage == Stage::Ready;
-    FillBox(dc, client, kBackground);
-    SetBkMode(dc, TRANSPARENT);
-    const wchar_t* heading = ready ? L"The game is ready." : L"Preparing the game for this PC. This only happens once.";
-    DrawLine(dc, l.heading, heading, kText, DT_LEFT);
-    DrawLine(dc, l.stage, StageText(), kDim, DT_LEFT);
-    FillBox(dc, l.bar, kBarEmpty);
-    RECT filled = l.bar;
-    filled.right = l.bar.left + LONG(float(l.bar.right - l.bar.left) * Fraction());
-    FillBox(dc, filled, kBarFull);
-    if (ready) {
-        PaintChoices(dc, l, unit);
-        return;
+// the room: teal darkening downwards, a faint grid, the terminal's scanlines, and a thin green edge
+void PaintRoom(uint32_t* pixels, int w, int h, int grid) {
+    for (int y = 0; y < h; y++) {
+        int t = h > 1 ? y * 255 / (h - 1) : 0;
+        COLORREF row = Mix(kBack2, kBack, t);
+        bool scan = y % 3 == 0;
+        for (int x = 0; x < w; x++) {
+            COLORREF c = row;
+            if (x % grid == 0 || y % grid == 0) c = Mix(c, kGreen, 22);
+            if (scan) c = Mix(c, RGB(0, 0, 0), 40);
+            if (x == 0 || y == 0 || x == w - 1 || y == h - 1) c = kGreenDim;
+            pixels[size_t(y) * w + x] = (GetRValue(c) << 16) | (GetGValue(c) << 8) | GetBValue(c);
+        }
     }
-    DrawLine(dc, l.bottom, std::to_wstring(int(Fraction() * 100.0f)) + L"%", kDim, DT_LEFT);
-    DrawLine(dc, l.bottom, TimeLeftText(), kDim, DT_RIGHT);
 }
 
-int Unit(HWND hwnd) { return MulDiv(10, GetDpiForWindow(hwnd), 96); }
+// the title as the game writes its big words: white, a red edge offset down-right, a black outline
+void PaintWord(HDC dc, int x, int y, int s3, const std::wstring& text) {
+    HGDIOBJ old = SelectObject(dc, g_fonts.word);
+    RECT r{};
+    DrawTextW(dc, text.c_str(), -1, &r, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+    auto at = [&](int dx, int dy, COLORREF c) {
+        RECT box{x + dx, y + dy, x + dx + r.right + s3 * 4, y + dy + r.bottom};
+        SetTextColor(dc, c);
+        DrawTextW(dc, text.c_str(), -1, &box, DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP);
+    };
+    for (int dx = -1; dx <= 1; dx++)
+        for (int dy = -1; dy <= 1; dy++)
+            if (dx || dy) at(dx * s3, dy * s3, kBlack);
+    at(s3 + s3 / 3, s3 + s3 / 3, kRed);
+    at(0, 0, kWhite);
+    SelectObject(dc, old);
+}
+
+// the menu frame: a tab with a slanted right edge on top, the box's top right corner cut off
+void PaintFrame(HDC dc, RECT box, const wchar_t* tab, int (*s)(int)) {
+    int cut = s(18), th = s(26), line = std::max(1, s(2));
+    HGDIOBJ old = SelectObject(dc, g_fonts.term);
+    SIZE ts{};
+    GetTextExtentPoint32W(dc, tab, int(wcslen(tab)), &ts);
+    int tw = ts.cx + s(40);
+    POINT outline[] = {{box.left, box.top + th},           {box.right - cut, box.top + th}, {box.right, box.top + th + cut},
+                       {box.right, box.bottom},            {box.left, box.bottom}};
+    Shape(dc, outline, 5, kGreen, line, kPanel);
+    POINT t[] = {{box.left + s(10), box.top + th},       {box.left + s(10), box.top},
+                 {box.left + s(10) + tw - s(14), box.top}, {box.left + s(10) + tw, box.top + s(14)},
+                 {box.left + s(10) + tw, box.top + th}};
+    Shape(dc, t, 5, kGreen, line, Mix(kBack2, kGreen, 60));
+    RECT label{box.left + s(22), box.top, box.left + s(10) + tw, box.top + th};
+    DrawLine(dc, label, tab, kGreen, DT_LEFT);
+    SelectObject(dc, old);
+}
+
+UINT g_dpi = 96;
+int Scaled(int v) { return MulDiv(v, int(g_dpi), 96); }
+
+void Paint(HDC dc, const RECT& client) {
+    auto s = Scaled;
+    SetBkMode(dc, TRANSPARENT);
+    int w = client.right, h = client.bottom;
+
+    // the header: the title, what this screen is, and a rule under them
+    std::wstring title = kGame.title;
+    for (wchar_t& c : title) c = wchar_t(towupper(c));
+    PaintWord(dc, s(22), s(10), std::max(1, s(2)), title);
+    HGDIOBJ old = SelectObject(dc, g_fonts.term);
+    DrawLine(dc, {s(24), s(10), w - s(24), s(36)}, L"FIRST START", kGreenDim, DT_RIGHT);
+    DrawLine(dc, {s(24), s(36), w - s(24), s(62)}, L"PREPARING THE GAME FOR THIS PC", kGreen, DT_RIGHT);
+    HPEN rule = CreatePen(PS_SOLID, 1, kGreenDim);
+    HGDIOBJ old_pen = SelectObject(dc, rule);
+    MoveToEx(dc, s(22), s(72), nullptr);
+    LineTo(dc, w - s(22), s(72));
+    SelectObject(dc, old_pen);
+    DeleteObject(rule);
+
+    // the frame and what is in it
+    bool stopping = g_progress.cancel;
+    RECT frame{s(22), s(86), w - s(22), h - s(20)};
+    PaintFrame(dc, frame, stopping ? L"STOPPING" : L"PREPARING", s);
+    int left = frame.left + s(22), right = frame.right - s(22), y = frame.top + s(38);
+
+    SelectObject(dc, g_fonts.heading);
+    DrawLine(dc, {left, y, right, y + s(28)}, stopping ? L"STOPPING" : L"BUILDING THE GAME'S CODE", stopping ? kRed : kGreen,
+             DT_LEFT);
+    y += s(30);
+    SelectObject(dc, g_fonts.body);
+    DrawLine(dc, {left, y, right, y + s(22)},
+             L"Once, on the first start of a new build. The game starts by itself when it is done.", kWhite, DT_LEFT);
+    y += s(32);
+
+    SelectObject(dc, g_fonts.term);
+    std::wstring stage = stopping ? L"Stopping, what is done so far is kept" : StageText();
+    DrawLine(dc, {left, y, right, y + s(20)}, L"> " + stage, kGreen, DT_LEFT);
+    DrawLine(dc, {left, y, right, y + s(20)}, std::to_wstring(int(Fraction() * 100.0f)) + L"%", kWhite, DT_RIGHT);
+    y += s(24);
+
+    RECT bar{left, y, right, y + s(18)};
+    FillBox(dc, bar, kBarEmpty);
+    RECT filled = bar;
+    filled.right = bar.left + LONG(float(bar.right - bar.left) * Fraction());
+    FillBox(dc, filled, kGreen);
+    HBRUSH edge = CreateSolidBrush(kGreenDim);
+    FrameRect(dc, &bar, edge);
+    DeleteObject(edge);
+    y += s(26);
+
+    std::wstring left_text = TimeLeftText();
+    DrawLine(dc, {left, y, right, y + s(20)}, left_text, kGreenDim, DT_LEFT);
+    DrawLine(dc, {left, y, right, y + s(20)}, L"ESC STOPS", kGreenDim, DT_RIGHT);
+    SelectObject(dc, old);
+}
 
 // painted off screen, then copied, so the bar does not flicker
 void PaintWindow(HWND hwnd) {
@@ -569,69 +672,30 @@ void PaintWindow(HWND hwnd) {
     HDC dc = BeginPaint(hwnd, &ps);
     RECT client;
     GetClientRect(hwnd, &client);
+    BITMAPINFO bi{};
+    bi.bmiHeader = {sizeof(BITMAPINFOHEADER), client.right, -client.bottom, 1, 32, BI_RGB};
+    void* bits = nullptr;
     HDC memory = CreateCompatibleDC(dc);
-    HBITMAP bitmap = CreateCompatibleBitmap(dc, client.right, client.bottom);
-    HGDIOBJ old_bitmap = SelectObject(memory, bitmap);
-    HGDIOBJ old_font = SelectObject(memory, reinterpret_cast<HFONT>(GetWindowLongPtrW(hwnd, GWLP_USERDATA)));
-    Paint(memory, client, Unit(hwnd));
-    BitBlt(dc, 0, 0, client.right, client.bottom, memory, 0, 0, SRCCOPY);
-    SelectObject(memory, old_font);
-    SelectObject(memory, old_bitmap);
-    DeleteObject(bitmap);
+    HBITMAP bitmap = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (bitmap && bits) {
+        HGDIOBJ old_bitmap = SelectObject(memory, bitmap);
+        PaintRoom(static_cast<uint32_t*>(bits), client.right, client.bottom, std::max(8, Scaled(40)));
+        Paint(memory, client);
+        BitBlt(dc, 0, 0, client.right, client.bottom, memory, 0, 0, SRCCOPY);
+        SelectObject(memory, old_bitmap);
+    }
+    if (bitmap) DeleteObject(bitmap);
     DeleteDC(memory);
     EndPaint(hwnd, &ps);
 }
 
-// what the compiler folder holds, shown beside the delete box
-uint64_t CompilerBytes() {
-    uint64_t bytes = 0;
-    std::error_code ec;
-    for (auto& e : fs::recursive_directory_iterator(CompilerDir(), ec))
-        if (e.is_regular_file(ec)) bytes += e.file_size(ec);
-    return bytes;
-}
-
-// the game runs from the DLLs alone; a later release brings the compiler again
-void DeleteCompiler() {
-    std::error_code ec;
-    fs::remove_all(CompilerDir(), ec);
-    if (ec) LOGE("Game code: deleting the compiler folder failed: %s", ec.message().c_str());
-    else LOGR("Game code: compiler folder deleted");
-}
-
 void CloseWindowWith(HWND hwnd, bool start) {
     g_start = start;
-    if (g_progress.stage == Stage::Ready && g_delete_compiler) DeleteCompiler();
-    DeleteObject(reinterpret_cast<HFONT>(GetWindowLongPtrW(hwnd, GWLP_USERDATA)));
     DestroyWindow(hwnd);
-}
-
-// once ready: Start or Enter starts the game, Exit, Escape or the close button leaves, Space ticks the delete box
-void OnClick(HWND hwnd, LPARAM lp) {
-    if (g_progress.stage != Stage::Ready) return;
-    RECT client;
-    GetClientRect(hwnd, &client);
-    Layout l = Arrange(client, Unit(hwnd));
-    POINT at{short(LOWORD(lp)), short(HIWORD(lp))};
-    if (PtInRect(&l.start, at)) CloseWindowWith(hwnd, true);
-    else if (PtInRect(&l.exit, at)) CloseWindowWith(hwnd, false);
-    else if (PtInRect(&l.delete_toggle, at)) g_delete_compiler = !g_delete_compiler;
-}
-
-// a controller's A starts, B leaves and X ticks the delete box, once ready; on the press, not the hold
-void PollController(HWND hwnd) {
-    static uint16_t held = 0;
-    uint16_t now = input::HeldOnAnyController();
-    uint16_t pressed = now & ~held;
-    held = now;
-    if (g_progress.stage != Stage::Ready) return;
-    if (pressed & XINPUT_GAMEPAD_X) g_delete_compiler = !g_delete_compiler;
-    if (pressed & XINPUT_GAMEPAD_A) CloseWindowWith(hwnd, true);
-    else if (pressed & XINPUT_GAMEPAD_B) CloseWindowWith(hwnd, false);
+    DeleteFonts();
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    bool ready = g_progress.stage == Stage::Ready;
     switch (msg) {
         case WM_PAINT:
             PaintWindow(hwnd);
@@ -640,67 +704,43 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 1;
         case WM_TIMER:
             InvalidateRect(hwnd, nullptr, FALSE);
-            PollController(hwnd);
             return 0;
-        case WM_LBUTTONUP:
-            OnClick(hwnd, lp);
-            return 0;
+        case WM_NCHITTEST:
+            return HTCAPTION;  // no title bar: the whole window drags it
         case WM_KEYDOWN:
-            if (ready && wp == VK_SPACE) g_delete_compiler = !g_delete_compiler;
-            if (ready && (wp == VK_RETURN || wp == VK_ESCAPE)) CloseWindowWith(hwnd, wp == VK_RETURN);
-            InvalidateRect(hwnd, nullptr, FALSE);
+            if (wp == VK_ESCAPE) g_progress.cancel = true;
             return 0;
-        case WM_CLOSE: {
-            if (ready) {
-                CloseWindowWith(hwnd, false);
-                return 0;
-            }
-            const wchar_t* question = L"Stop preparing the game? What is done so far is kept, and the next start carries on.";
-            if (MessageBoxW(hwnd, question, kGame.title, MB_YESNO | MB_ICONQUESTION) == IDYES) g_progress.cancel = true;
+        case WM_CLOSE:
+            g_progress.cancel = true;  // the build ends at its next step, then the window closes
             return 0;
-        }
         case kBuildDone:
-            if (!wp) {
-                CloseWindowWith(hwnd, false);  // failed or stopped; ready stays up for the player's pick
-                return 0;
-            }
-            g_compiler_bytes = CompilerBytes();
-            // XBE_AUTOSTART: unattended test runs start the game as Start would
-            if (std::getenv("XBE_AUTOSTART")) {
-                CloseWindowWith(hwnd, true);
-                return 0;
-            }
-            FlashWindow(hwnd, TRUE);
+            CloseWindowWith(hwnd, wp != 0);  // built: straight into the game; failed or stopped: out
             return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-// centred on the primary monitor, sized for its DPI, in the message font
+// centred on the primary monitor, sized for its DPI, borderless with its own edge
 HWND OpenWindow() {
     HINSTANCE inst = GetModuleHandleW(nullptr);
     WNDCLASSEXW wc{sizeof(wc)};
     wc.lpfnWndProc = WndProc;
     wc.hInstance = inst;
     wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
-    wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));  // IDC_ARROW
+    wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32650));  // IDC_APPSTARTING
     std::wstring class_name = std::wstring(kGame.name) + L"GameCode";
     wc.lpszClassName = class_name.c_str();
     RegisterClassExW(&wc);
-    UINT dpi = GetDpiForSystem();
-    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-    RECT r{0, 0, MulDiv(520, dpi, 96), MulDiv(130, dpi, 96)};
-    AdjustWindowRectExForDpi(&r, style, FALSE, 0, dpi);
-    int w = r.right - r.left;
-    int h = r.bottom - r.top;
+    g_dpi = GetDpiForSystem();
+    MakeFonts(g_dpi);
+    int w = Scaled(640), h = Scaled(292);
     int x = (GetSystemMetrics(SM_CXSCREEN) - w) / 2;
     int y = (GetSystemMetrics(SM_CYSCREEN) - h) / 2;
-    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, kGame.title, style, x, y, w, h, nullptr, nullptr, inst, nullptr);
-    NONCLIENTMETRICSW metrics{sizeof(metrics)};
-    SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0, dpi);
-    SetWindowLongPtrW(hwnd, GWLP_USERDATA, LONG_PTR(CreateFontIndirectW(&metrics.lfMessageFont)));
-    SetTimer(hwnd, 1, 50, nullptr);  // the controller is read with each repaint
+    HWND hwnd = CreateWindowExW(WS_EX_APPWINDOW, wc.lpszClassName, kGame.title, WS_POPUP | WS_MINIMIZEBOX | WS_SYSMENU,
+                                x, y, w, h, nullptr, nullptr, inst, nullptr);
+    SetTimer(hwnd, 1, 100, nullptr);
     ShowWindow(hwnd, SW_SHOW);
+    SetForegroundWindow(hwnd);
     return hwnd;
 }
 
@@ -735,7 +775,6 @@ bool BuildWithWindow(std::vector<Target>& targets) {
         return false;
     }
     SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);  // no sleep while it works
-    input::Init();
     g_window = OpenWindow();
     bool ok = false;
     std::thread worker([&] {
