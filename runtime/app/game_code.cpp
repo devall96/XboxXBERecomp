@@ -24,6 +24,8 @@
 #include <map>
 #include <mutex>
 
+#include <SDL3/SDL.h>
+
 #include "core/platform.h"
 #endif
 
@@ -1280,13 +1282,61 @@ std::wstring CompileLogTail() {
     return platform::Wide(tail);
 }
 
-// no window yet: the build runs before the game window opens, its progress in the log
+// SDL's renderer and its built-in 8x8 text at a scale: the build runs before the game window opens
+void DrawText(SDL_Renderer* r, float scale, float x, float y, const std::wstring& text, SDL_Color c) {
+    SDL_SetRenderScale(r, scale, scale);
+    SDL_SetRenderDrawColor(r, c.r, c.g, c.b, 255);
+    SDL_RenderDebugText(r, x / scale, y / scale, platform::Utf8(text).c_str());
+    SDL_SetRenderScale(r, 1, 1);
+}
+
+// the build's progress in a small window of the Configuration app's colours; closing it cancels the build
+bool BuildInWindow(std::vector<Target>& targets) {
+    constexpr int kW = 760, kH = 250;
+    SDL_Window* window = nullptr;
+    SDL_Renderer* r = nullptr;
+    if (!SDL_CreateWindowAndRenderer(platform::Utf8(kGame.title).c_str(), kW, kH, 0, &window, &r)) {
+        LOGW("Game code: no progress window (%s), the progress is in the log", SDL_GetError());
+        return Build(targets);
+    }
+    SDL_SetRenderVSync(r, 1);
+    std::atomic<bool> done{false};
+    bool ok = false;
+    std::thread worker([&] {
+        ok = Build(targets);
+        done = true;
+    });
+    const SDL_Color green{57, 242, 138, 255}, dim{40, 150, 100, 255}, white{230, 240, 235, 255};
+    while (!done) {
+        SDL_Event e;
+        while (SDL_PollEvent(&e))
+            if (e.type == SDL_EVENT_QUIT || e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) g_progress.cancel = true;
+        SDL_SetRenderDrawColor(r, 5, 22, 24, 255);
+        SDL_RenderClear(r);
+        DrawText(r, 2, 24, 20, kGame.title, dim);
+        DrawText(r, 3, 24, 48, g_progress.cancel ? L"STOPPING" : L"PREPARING THE GAME", green);
+        DrawText(r, 2, 24, 100, StageText(), white);
+        DrawText(r, 2, 24, 128, TimeLeftText(), dim);
+        SDL_FRect bar{24, 170, kW - 48.0f, 26};
+        SDL_SetRenderDrawColor(r, green.r, green.g, green.b, 255);
+        SDL_RenderRect(r, &bar);
+        SDL_FRect fill{bar.x + 3, bar.y + 3, (bar.w - 6) * std::clamp(Fraction(), 0.0f, 1.0f), bar.h - 6};
+        SDL_RenderFillRect(r, &fill);
+        DrawText(r, 1, 24, 214, L"Built once from your own copy of the game; later starts go straight in.", dim);
+        SDL_RenderPresent(r);
+    }
+    worker.join();
+    SDL_DestroyRenderer(r);
+    SDL_DestroyWindow(window);
+    return ok;
+}
+
 bool BuildWithWindow(std::vector<Target>& targets) {
     if (std::wstring blocker = Blocker(targets); !blocker.empty()) {
         platform::Message(kGame.title, blocker, true);
         return false;
     }
-    bool ok = Build(targets);
+    bool ok = BuildInWindow(targets);
     if (!ok && !g_progress.cancel) {
         std::wstring text = L"Preparing the game failed. " + g_failure;
         if (std::wstring tail = CompileLogTail(); !tail.empty()) text += L"\n\nThe last lines of the log:\n\n" + tail;

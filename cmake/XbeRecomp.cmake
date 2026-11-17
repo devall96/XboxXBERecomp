@@ -109,6 +109,9 @@ file(GLOB XBE_RUNTIME_SOURCES CONFIGURE_DEPENDS ${XBE_SDK_DIR}/runtime/*/*.cpp)
 # are fetched as sources, the HLSL to SPIR-V compiler is glslang with SPIRV-Tools (Linux: the system's, Windows: built
 # from source here).
 option(XBE_VULKAN "the Vulkan renderer (always on Linux, beside D3D12 on Windows)" ON)
+# glslang built here rather than the system's: always on Windows; on Linux for releases built on an older system, whose
+# own glslang is too old (the linux-portable preset)
+option(XBE_FETCH_GLSLANG "build glslang and SPIRV-Tools from source" ${WIN32})
 set(XBE_RENDERER_DEFS)
 set(XBE_RENDERER_SOURCES)
 set(XBE_RENDERER_LIBS)
@@ -125,7 +128,7 @@ if(XBE_VULKAN)
     FetchContent_Declare(vma GIT_REPOSITORY https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git
                          GIT_TAG v3.2.0 GIT_SHALLOW TRUE SOURCE_SUBDIR none)
     FetchContent_MakeAvailable(vulkan_headers volk vma)
-    if(WIN32)
+    if(WIN32 OR XBE_FETCH_GLSLANG)
         # one Vulkan SDK release of all three
         set(XBE_SPIRV_TAG vulkan-sdk-1.4.304.0)
         FetchContent_Declare(spirv_headers GIT_REPOSITORY https://github.com/KhronosGroup/SPIRV-Headers.git
@@ -151,12 +154,14 @@ if(XBE_VULKAN)
         set(SPIRV-Headers_SOURCE_DIR ${spirv_headers_SOURCE_DIR})
         FetchContent_MakeAvailable(spirv_tools glslang)
         list(APPEND XBE_RENDERER_LIBS glslang glslang-default-resource-limits SPIRV)
-        list(APPEND XBE_RENDERER_DEFS VK_USE_PLATFORM_WIN32_KHR)
     else()
         find_package(glslang CONFIG REQUIRED)
         # link only: the package's include directory is /usr/include, which as -isystem breaks libstdc++'s header order
         list(APPEND XBE_RENDERER_LIBS $<LINK_ONLY:glslang::glslang> $<LINK_ONLY:glslang::SPIRV>
              $<LINK_ONLY:glslang::glslang-default-resource-limits>)
+    endif()
+    if(WIN32)
+        list(APPEND XBE_RENDERER_DEFS VK_USE_PLATFORM_WIN32_KHR)
     endif()
     list(APPEND XBE_RENDERER_DEFS XBE_VULKAN IMGUI_IMPL_VULKAN_USE_VOLK)
     list(APPEND XBE_RENDERER_SOURCES ${volk_SOURCE_DIR}/volk.c ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp)
