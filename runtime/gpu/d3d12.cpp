@@ -700,6 +700,7 @@ private:
     PerfClock::time_point run_start_ = PerfClock::now();
     PerfClock::time_point last_present_{};
     FILE* frame_times_ = nullptr;
+    uint64_t frame_counts_[6] = {};  // g_perf's counts at the last frame time line
     ComPtr<ID3D12PipelineState> easu_pso_, final_pso_;
     bool present_failed_ = false;
     // HDR10: the frame and the UI drawn to sdr_ as always, then sdr_ to the 10 bit PQ swap chain (ps_hdr)
@@ -3786,14 +3787,27 @@ void D3D12Backend::WriteFrameTime() {
     if (!frame_times_) {
         frame_times_ = _wfopen(diag::FrameTimesFile().c_str(), L"w");
         if (!frame_times_) return;
-        fputs("present,time_ms,interval_ms\n", frame_times_);
+        // per frame, what can make one late: shaders compiled, pipelines made, texture uploads, new textures,
+        // read-backs the title waited for, new targets
+        fputs("present,time_ms,interval_ms,shaders,pipelines,tex_uploads,new_textures,read_backs,new_targets\n",
+              frame_times_);
         last_present_ = PerfClock::now();
+        // this line's log time against the frame clock lines the two up
+        LOGR("Frame times: frame clock %.3f ms", std::chrono::duration<double, std::milli>(last_present_ - run_start_).count());
     }
     auto now = PerfClock::now();
     double t = std::chrono::duration<double, std::milli>(now - run_start_).count();
     double dt = std::chrono::duration<double, std::milli>(now - last_present_).count();
     last_present_ = now;
-    fprintf(frame_times_, "%llu,%.3f,%.3f\n", (unsigned long long)presents_, t, dt);
+    // g_perf counts up between its once a second resets (XBE_PERF): a count below the last is a fresh start
+    uint64_t counts[6] = {g_perf.shaders, g_perf.psos, g_perf.texups, g_perf.newtex, g_perf.syncs, g_perf.targets};
+    unsigned long long d[6];
+    for (int i = 0; i < 6; i++) {
+        d[i] = counts[i] >= frame_counts_[i] ? counts[i] - frame_counts_[i] : counts[i];
+        frame_counts_[i] = counts[i];
+    }
+    fprintf(frame_times_, "%llu,%.3f,%.3f,%llu,%llu,%llu,%llu,%llu,%llu\n", (unsigned long long)presents_, t, dt, d[0],
+            d[1], d[2], d[3], d[4], d[5]);
     constexpr uint64_t kFlushEvery = 60;
     if (presents_ % kFlushEvery == 0) fflush(frame_times_);
 }
@@ -4602,6 +4616,6 @@ void D3D12Backend::SetGamma(const uint8_t* ramp) {
 
 }  // namespace
 
-std::unique_ptr<Backend> CreateBackend() { return std::make_unique<D3D12Backend>(); }
+std::unique_ptr<Backend> CreateD3D12Backend() { return std::make_unique<D3D12Backend>(); }
 
 }  // namespace gpu

@@ -57,7 +57,12 @@ private:
     uint32_t fence_ = 0;
 };
 
+// the renderer the settings name where the build has a choice (Windows: D3D12 or Vulkan), else the platform's
 std::unique_ptr<Backend> CreateBackend();
+// after the chosen renderer failed to start: the other one, or null
+std::unique_ptr<Backend> CreateFallbackBackend();
+std::unique_ptr<Backend> CreateD3D12Backend();
+std::unique_ptr<Backend> CreateVulkanBackend();
 // the same backend driven from a thread of its own: calls return once recorded
 std::unique_ptr<Backend> CreateThreadedBackend(std::unique_ptr<Backend> inner);
 

@@ -14,7 +14,8 @@ struct Pad;
 namespace app {
 
 enum class DisplayMode : uint32_t { Fullscreen, Borderless, Windowed };
-inline constexpr uint32_t kFpsCapRefresh = 1;  // fps_cap: the monitor's refresh rate
+inline constexpr uint32_t kFpsCapRefresh = 1;
+inline constexpr uint32_t kRendererD3D12 = 0, kRendererVulkan = 1;  // fps_cap: the monitor's refresh rate
 // vsync_mode: how frames meet the display
 enum class VSync : uint32_t {
     Off,       // present at once, tearing where the display allows it (lowest latency)
@@ -53,6 +54,9 @@ struct Settings {
     uint32_t colour_filter = 0;        // colour vision: 0 none, 1 protanopia, 2 deuteranopia, 3 tritanopia
     uint32_t colour_filter_strength = 100;  // percent
     std::string colour_lut;            // a .cube file in luts\ in the data folder, empty for none
+    // the renderer where there is a choice (Windows): kRendererD3D12 (the default until Vulkan has every feature, HDR10
+    // among them) or kRendererVulkan; Linux always draws with Vulkan
+    uint32_t renderer = 0;
     uint32_t upscaler = 1;             // 0 bilinear, 1 AMD FSR 1 (EASU) when the view renders smaller than it shows
     uint32_t sharpen = 0;              // 0 off, to 100: FSR 1's RCAS, 2 stops (100 the sharpest)
     // HDR10 output where Windows has the display in HDR: the picture's white at hdr_paper_white nits, its brightest

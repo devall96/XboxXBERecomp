@@ -326,13 +326,18 @@ void SetFrameBuffers(const char* caller, uint32_t pp) {
     }
     if (!g_backend) {
         g_backend = gpu::CreateBackend();
-        if (!g_backend->Init(w, h)) {
+        bool started = g_backend && g_backend->Init(w, h);
+        if (!started) {
+            g_backend = gpu::CreateFallbackBackend();
+            started = g_backend && g_backend->Init(w, h);
+        }
+        if (!started) {
             LOGE("d3d: renderer init failed");
             // no owner window: this runs on the title's thread and the window may already be fullscreen over the box
 #ifdef _WIN32
             MessageBoxW(nullptr,
-                        L"Direct3D 12 could not be started. Make sure your graphics card supports it and its driver "
-                        L"is up to date.",
+                        L"The renderer could not be started. Make sure your graphics card supports Direct3D 12 or "
+                        L"Vulkan 1.3 and its driver is up to date.",
                         app::kGame.short_title, MB_ICONERROR | MB_TOPMOST);
 #else
             platform::Message(app::kGame.short_title,

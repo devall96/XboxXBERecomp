@@ -30,6 +30,7 @@ namespace {
 const char* kModes[] = {"fullscreen", "borderless", "windowed"};
 const char* kWide[] = {"console", "off", "expand"};
 const char* kVSync[] = {"off", "on", "adaptive", "fast", "vrr"};
+const char* kRenderers[] = {"d3d12", "vulkan"};
 
 std::filesystem::path File() { return DataDir() / kGame.settings; }
 
@@ -76,6 +77,9 @@ void Load() {
     for (uint32_t i = 0; i < 3; i++)
         if (wide == kWide[i]) s.widescreen = Wide(i);
     if (s.widescreen == Wide::Expand && !kGame.expands) s.widescreen = Wide::Console;
+    std::string renderer = t["renderer"].value_or(std::string(kRenderers[s.renderer]));
+    for (uint32_t i = 0; i < 2; i++)
+        if (renderer == kRenderers[i]) s.renderer = i;
     s.upscaler = std::min(t["upscaler"].value_or(s.upscaler), 1u);
     s.hud_edge = std::min(t["hud_edge"].value_or(s.hud_edge), 100u);
     s.hud_visible = t["hud_visible"].value_or(s.hud_visible);
@@ -122,6 +126,7 @@ toml::table Table() {
                   {"save_profile", s.save_profile},
                   {"audio_output", int64_t(s.audio_output)},
                   {"widescreen", kWide[uint32_t(s.widescreen)]},
+                  {"renderer", kRenderers[s.renderer]},
                   {"upscaler", int64_t(s.upscaler)},
                   {"hud_edge", int64_t(s.hud_edge)},
                   {"hud_visible", s.hud_visible},
