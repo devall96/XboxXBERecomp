@@ -249,8 +249,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     if (app::kGame.launcher && !relaunched && !app::kGame.launcher()) return 0;
 
     app::GameFiles game;
-    if (!app::FindGame(game)) return 1;
-    if (!app::PrepareGameCode(game)) return 1;
+    if (!app::FindGame(game)) return app::GameError();
+    if (!app::PrepareGameCode(game)) return app::GameCodeError();
 
     bool splash = app::OpenSplash(), handover = app::StartHandover();
 

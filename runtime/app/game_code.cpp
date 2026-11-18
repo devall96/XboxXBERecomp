@@ -1451,6 +1451,8 @@ BuildStatus GameCodeBuildStatus() {
 
 void CancelGameCodeBuild() { g_progress.cancel = true; }
 
+int GameCodeError() { return g_progress.cancel ? 0 : kExitGameCode; }
+
 bool PrepareGameCode(const GameFiles& game) {
     // one build at a time: a second copy of the game started meanwhile waits for it, then finds the DLL current
     std::vector<Image> images = Images();

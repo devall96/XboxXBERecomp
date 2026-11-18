@@ -17,6 +17,8 @@ void SetArgs(int argc, char** argv);  // Linux: main's arguments, before anythin
 const std::vector<std::string>& Args();  // Linux: main's arguments; empty on Windows
 // the number after an argument ("--instance 2" or "--instance2"), def without the argument
 int ArgInt(const wchar_t* name, int def);
+// "--name <value>" or "--name=<value>"; empty when it is not given
+std::wstring ArgString(const wchar_t* name);
 bool HasArg(const wchar_t* name);
 
 // a detached thread with stack bytes for its stack: recompiled code nests host frames as deep as the guest's calls

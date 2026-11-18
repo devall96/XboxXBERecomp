@@ -265,6 +265,16 @@ int ArgInt(const wchar_t* name, int def) {
     return def;
 }
 
+std::wstring ArgString(const wchar_t* name) {
+    std::vector<std::wstring> words = ArgWords();
+    std::wstring eq = std::wstring(name) + L"=";
+    for (size_t i = 0; i < words.size(); i++) {
+        if (words[i] == name) return i + 1 < words.size() ? words[i + 1] : std::wstring();
+        if (words[i].compare(0, eq.size(), eq) == 0) return words[i].substr(eq.size());
+    }
+    return {};
+}
+
 bool HasArg(const wchar_t* name) {
     for (const std::wstring& w : ArgWords())
         if (w == name) return true;

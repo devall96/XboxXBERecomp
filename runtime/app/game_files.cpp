@@ -61,7 +61,31 @@ bool ReadHostFile(const fs::path& path, std::vector<uint8_t>& out) {
     return true;
 }
 
+// why FindGame last failed, and whether it may show a dialog
+int g_game_error = 0;
+std::wstring g_game_error_text;
+bool g_quiet = false;
+
+// why the game can't start: told the player, and kept for GameErrorText
+void Tell(const std::wstring& text, int error) {
+    g_game_error = error;
+    g_game_error_text = text;
+    if (!g_quiet) platform::Message(kGame.short_title, text, true);
+}
+
 }  // namespace
+
+fs::path GameArg() {
+    std::wstring arg = platform::ArgString(L"--game");
+    if (arg.empty()) return {};
+    std::error_code ec;
+    fs::path p = fs::absolute(fs::path(arg), ec);
+    return ec ? fs::path(arg) : p;
+}
+
+int GameError() { return g_game_error ? g_game_error : kExitNoGame; }
+std::wstring GameErrorText() { return g_game_error_text; }
+void QuietGameErrors() { g_quiet = true; }
 
 std::string Sha1(const std::vector<uint8_t>& data) {
     alignas(8) uint8_t ctx[128];
@@ -78,10 +102,28 @@ std::string Sha1(const std::vector<uint8_t>& data) {
 }
 
 bool FindGame(GameFiles& game) {
-    fs::path assets = FindAssets();
+    g_game_error = 0;
+    g_game_error_text.clear();
     std::vector<fs::path> isos;
     std::error_code ec;
-    if (!assets.empty())
+    fs::path given = GameArg(), assets;
+    bool folder = true;  // the folder's own files are a copy too; not for a disc image given by --game
+    if (!given.empty()) {
+        if (fs::is_directory(given, ec)) {
+            assets = given;
+        } else if (fs::is_regular_file(given, ec)) {
+            assets = given.parent_path();
+            isos.push_back(given);
+            folder = false;
+        } else {
+            LOGE("game: --game %s does not exist", given.string().c_str());
+            Tell(L"The game was not found at " + given.wstring() + L".", kExitNoGame);
+            return false;
+        }
+    } else {
+        assets = FindAssets();
+    }
+    if (!assets.empty() && isos.empty())
         for (auto& e : fs::directory_iterator(assets, ec)) {
             std::wstring ext = e.path().extension().wstring();
             std::transform(ext.begin(), ext.end(), ext.begin(), [](wchar_t c) { return wchar_t(std::towlower(c)); });
@@ -111,7 +153,7 @@ bool FindGame(GameFiles& game) {
     };
 
     std::vector<uint8_t> xbe;
-    if (!assets.empty() && ReadHostFile(assets / IMAGE_XBE, xbe) && consider(assets, std::move(xbe), nullptr)) return true;
+    if (folder && !assets.empty() && ReadHostFile(assets / IMAGE_XBE, xbe) && consider(assets, std::move(xbe), nullptr)) return true;
     for (const fs::path& iso : isos) {
         auto disc = std::make_unique<kernel::Disc>();
         std::string error;
@@ -127,7 +169,7 @@ bool FindGame(GameFiles& game) {
     }
 
     if (other_name.empty()) {
-        platform::Message(kGame.short_title, kGame.missing, true);
+        Tell(kGame.missing, kExitNoGame);
         return false;
     }
     if (kGame.one_release) {
@@ -139,13 +181,17 @@ bool FindGame(GameFiles& game) {
                             std::wstring(kImageSha1, kImageSha1 + std::strlen(kImageSha1)) + L"\nFound    " +
                             std::wstring(found.begin(), found.end());
         LOGE("game: %s is another release (sha1 %s), refused", other_name.string().c_str(), found.c_str());
-        platform::Message(kGame.short_title, text, true);
+        Tell(text, kExitOtherRelease);
         return false;
     }
     std::wstring text = other_name.filename().wstring() +
                         L" is a different release of the game than this build was made from, and will most likely "
                         L"crash.\n\nStart it anyway?";
-    if (!platform::AskYesNo(kGame.short_title, text)) return false;
+    if (g_quiet || !platform::AskYesNo(kGame.short_title, text)) {
+        g_game_error = kExitOtherRelease;
+        g_game_error_text = text;
+        return false;
+    }
     game = std::move(other);
     kernel::MountDisc(std::move(other_disc));
     return true;

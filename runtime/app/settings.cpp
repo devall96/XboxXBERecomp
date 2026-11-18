@@ -22,12 +22,15 @@
 #include "app/app.h"
 #include "audio/audio.h"
 #include "core/log.h"
+#include "core/platform.h"
 
 namespace app {
 
 namespace {
 
 const char* kModes[] = {"fullscreen", "borderless", "windowed"};
+// windowed in the file, full screen for this run (RecompLauncher's Big Picture mode): saved as windowed again
+bool g_windowed_in_file = false;
 const char* kWide[] = {"console", "off", "expand"};
 const char* kVSync[] = {"off", "on", "adaptive", "fast", "vrr"};
 const char* kRenderers[] = {"d3d12", "vulkan"};
@@ -53,6 +56,13 @@ void Load() {
     std::string mode = t["display_mode"].value_or(std::string(kModes[uint32_t(s.display_mode)]));
     for (uint32_t i = 0; i < 3; i++)
         if (mode == kModes[i]) s.display_mode = DisplayMode(i);
+    // started from RecompLauncher's Big Picture mode (a controller, a TV, a Steam Deck): full screen, the file's own
+    // choice kept for a start from the desktop
+    g_windowed_in_file = s.display_mode == DisplayMode::Windowed && platform::Env(L"RECOMPLAUNCHER_MODE") == L"bigpicture";
+    if (g_windowed_in_file) {
+        s.display_mode = DisplayMode::Borderless;
+        LOGR("Settings: windowed, full screen for RecompLauncher's Big Picture mode");
+    }
     s.width = t["width"].value_or(s.width);
     s.height = t["height"].value_or(s.height);
     s.render_percent = t["render_percent"].value_or(s.render_percent);
@@ -107,7 +117,8 @@ namespace {
 
 toml::table Table() {
     const Settings& s = Get();
-    toml::table t{{"display_mode", kModes[uint32_t(s.display_mode)]},
+    DisplayMode mode = g_windowed_in_file && s.display_mode == DisplayMode::Borderless ? DisplayMode::Windowed : s.display_mode;
+    toml::table t{{"display_mode", kModes[uint32_t(mode)]},
                   {"width", int64_t(s.width)},
                   {"height", int64_t(s.height)},
                   {"render_percent", int64_t(s.render_percent)},

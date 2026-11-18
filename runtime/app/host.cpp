@@ -29,6 +29,14 @@ std::filesystem::path DataDir() {
             std::filesystem::create_directories(p, ec);
             if (p.is_absolute() && std::filesystem::is_directory(p, ec)) return p;
         }
+        // a portable.txt beside the program, or beside the AppImage, keeps everything in that folder
+        {
+            std::filesystem::path home = ExeDir();
+            std::wstring appimage = platform::Env(L"APPIMAGE");
+            if (!appimage.empty()) home = std::filesystem::path(appimage).parent_path();
+            std::error_code ec;
+            if (std::filesystem::is_regular_file(home / "portable.txt", ec)) return home;
+        }
 #ifndef _WIN32
         // an AppImage, or an installed copy, runs from a folder it cannot write: the player's data goes to
         // $XDG_DATA_HOME/<name> (~/.local/share/<name>)

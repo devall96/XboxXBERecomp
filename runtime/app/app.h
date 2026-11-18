@@ -118,6 +118,16 @@ struct GameFiles {
     std::vector<uint8_t> xbe;
 };
 bool FindGame(GameFiles& game);
+// --game <disc image or folder> plays that copy where it is, instead of the one in assets
+std::filesystem::path GameArg();
+// what the program exits with when it cannot start, so a launcher can tell the player why (0: the player stopped it)
+inline constexpr int kExitNoGame = 3;        // no copy of the game found, or it could not be read
+inline constexpr int kExitOtherRelease = 4;  // another release of the game than this build runs
+inline constexpr int kExitGameCode = 5;      // the game's code could not be built or loaded
+int GameError();                             // why the last FindGame failed: kExitNoGame or kExitOtherRelease
+std::wstring GameErrorText();                // and what it told the player
+void QuietGameErrors();                      // FindGame shows no dialogs (a setup step without a window)
+int GameCodeError();                         // after PrepareGameCode failed: kExitGameCode, or 0 when cancelled
 std::string Sha1(const std::vector<uint8_t>& data);  // lower case hex
 // the recompiled code, <exe>.dll, built from the game in assets when missing or out of date (game_code.cpp) and
 // loaded; false after telling the player why the game cannot start, or when they chose not to start it yet
