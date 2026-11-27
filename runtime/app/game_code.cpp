@@ -126,10 +126,13 @@ int64_t NowMs() {
 
 fs::path CompilerDir() { return ExeDir() / "compiler"; }
 // where the build writes its work and the finished library: the compiler folder, or (Linux, a folder the program
-// cannot write, as an AppImage's) gamecode/ in the data folder
+// cannot write, as an AppImage's, or RecompLauncher's data folder) gamecode/ in the data folder
 fs::path BuildDir() {
 #ifndef _WIN32
     if (access(ExeDir().c_str(), W_OK) != 0) return DataDir() / "gamecode";
+#endif
+#ifdef __linux__
+    if (!platform::Env(L"RECOMPLAUNCHER_DATA").empty() && DataDir() != ExeDir()) return DataDir() / "gamecode";
 #endif
     return CompilerDir();
 }
