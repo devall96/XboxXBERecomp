@@ -20,10 +20,11 @@ namespace app {
 
 #ifdef __linux__
 namespace {
-// the settings, disks, save backups and logs an earlier start left in from, copied (never moved: from keeps them) into
-// the data folder to, once. Each goes to <name>.copying first; only when every copy succeeded are they renamed into
-// place, and the marker is written last. A copy that was killed or failed (a full disk) leaves no half disk under its
-// real name, and the next start removes the *.copying it left and tries again. false: not copied this time.
+// the settings, disks, save backups, logs, texture packs, LUTs and screenshots an earlier start left in from, copied
+// (never moved: from keeps them) into the data folder to, once. Each goes to <name>.copying first; only when every copy
+// succeeded are they renamed into place, and the marker is written last. A copy that was killed or failed (a full disk)
+// leaves no half disk under its real name, and the next start removes the *.copying it left and tries again. false:
+// not copied this time.
 bool CopyEarlierData(const std::filesystem::path& from, const std::filesystem::path& to) {
     namespace fs = std::filesystem;
     const std::string part = ".copying";
@@ -43,7 +44,8 @@ bool CopyEarlierData(const std::filesystem::path& from, const std::filesystem::p
     bool ok = true;
     for (fs::directory_iterator it(from, ec), end; ok && !ec && it != end; it.increment(ec)) {
         std::string name = it->path().filename().string();
-        bool data = name == kGame.settings || name == "logs" || name == "profiles" || name.rfind("hdd", 0) == 0 ||
+        bool data = name == kGame.settings || name == "logs" || name == "profiles" || name == "textures" ||
+                    name == "luts" || name == "screenshots" || name.rfind("hdd", 0) == 0 ||
                     name.rfind("save backups", 0) == 0;
         if (!data || partial(name)) continue;
         std::error_code e;
