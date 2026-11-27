@@ -17,6 +17,25 @@
 
 namespace app {
 
+#ifdef __linux__
+namespace {
+// a data folder without settings or a disk yet gets the settings, disks, save backups and logs found in from (copied,
+// never moved: from keeps them)
+void CopyEarlierData(const std::filesystem::path& from, const std::filesystem::path& to) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (fs::equivalent(from, to, ec) || fs::exists(to / kGame.settings, ec) || fs::exists(to / "hdd", ec)) return;
+    for (auto& e : fs::directory_iterator(from, ec)) {
+        std::string name = e.path().filename().string();
+        bool data = name == kGame.settings || name == "logs" || name == "profiles" || name.rfind("hdd", 0) == 0 ||
+                    name.rfind("save backups", 0) == 0;
+        if (!data || fs::exists(to / name, ec)) continue;
+        fs::copy(e.path(), to / name, fs::copy_options::recursive, ec);
+    }
+}
+}  // namespace
+#endif
+
 std::filesystem::path DataDir() {
     static const std::filesystem::path dir = [] {
         std::wstring var;
@@ -29,6 +48,20 @@ std::filesystem::path DataDir() {
             std::filesystem::create_directories(p, ec);
             if (p.is_absolute() && std::filesystem::is_directory(p, ec)) return p;
         }
+#ifdef __linux__
+        // RecompLauncher's data folder for the game ({install}/recompdata), over a portable.txt: an unpacked AppImage's
+        // folder is replaced on every update. What an earlier start wrote beside the program is copied there once.
+        std::wstring launcher = platform::Env(L"RECOMPLAUNCHER_DATA");
+        if (!launcher.empty()) {
+            std::filesystem::path p(launcher);
+            std::error_code ec;
+            std::filesystem::create_directories(p, ec);
+            if (p.is_absolute() && std::filesystem::is_directory(p, ec)) {
+                CopyEarlierData(ExeDir(), p);
+                return p;
+            }
+        }
+#endif
         // a portable.txt beside the program, or beside the AppImage, keeps everything in that folder
         {
             std::filesystem::path home = ExeDir();

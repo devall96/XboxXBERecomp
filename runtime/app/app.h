@@ -104,8 +104,9 @@ float WideFactor();
 
 std::filesystem::path ExeDir();
 // where the player's data lives: the game's files (assets), saves (hdd), settings, logs, caches and texture packs.
-// <NAME>_DATA_ROOT (GameInfo::name upper case, e.g. UNCHAINED_DATA_ROOT) moves it, else the exe's folder. The program
-// (the exe, the built game code, the compiler) stays beside the exe.
+// <NAME>_DATA_ROOT (GameInfo::name upper case, e.g. UNCHAINED_DATA_ROOT) moves it, then (Linux) RecompLauncher's
+// RECOMPLAUNCHER_DATA, else the exe's folder. The program (the exe, the compiler and, unless RECOMPLAUNCHER_DATA or a
+// folder the exe cannot write moves it, the built game code) stays beside the exe.
 std::filesystem::path DataDir();
 // the console's hard disk: save_folder, else hdd (hddN for --instance N) beside the exe (saves.cpp)
 std::filesystem::path HardDisk();
